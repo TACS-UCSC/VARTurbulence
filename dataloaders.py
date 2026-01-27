@@ -7,7 +7,7 @@ import jax.random as random
 import matplotlib.pyplot as plt
 import threading
 import queue
-
+import h5py
 
 class PrefetchIterator:
     """Wraps an iterator to prefetch batches in a background thread."""
@@ -50,7 +50,7 @@ class PrefetchIterator:
         self.stop_event.set()
 
 # Load all turbulence data into memory
-def load_turbulence_data(data_dir, start_idx=10000, stop_idx=19999, normalize=False):
+def load_turbulence_data_mat(data_dir, start_idx=10000, stop_idx=19999, normalize=False):
     data = {}
     print(f"Loading {stop_idx - start_idx + 1} files...")
     for idx in range(start_idx, stop_idx + 1):
@@ -64,6 +64,41 @@ def load_turbulence_data(data_dir, start_idx=10000, stop_idx=19999, normalize=Fa
             data[idx] = (data[idx] - mean) / std
 
     return data
+
+# Load all turbulence data into memory
+def load_turbulence_data_rb_convection(data_loc, 
+                                       start_idx=None, 
+                                       stop_idx=None, 
+                                       normalize=False,
+                                       field = "buoyancy",
+                                       field_idx = 0):
+    ## loading the data as individual idx's into the data
+    f = h5py.File(data_loc, 'r')
+
+    # bcs_xperiodic = f["boundary_conditions"]["x_periodic"]
+    # bcs_y_wall_dirichlet = f["boundary_conditions"]["y_wall_dirichlet"]
+
+    # loading buoyancy, pressure, and velocity fields
+
+    if field == "buoyancy":
+        data = f["t0_fields"]["buoyancy"][field_idx, start_idx:stop_idx, :, :]
+    elif field == "pressure":
+        data = f["t0_fields"]["pressure"][field_idx, start_idx:stop_idx, :, :]
+    elif field == "velocity_x":
+        data = f["t1_fields"]["velocity"][field_idx, start_idx:stop_idx, :, :, 0]
+    elif field == "velocity_y":
+        data = f["t1_fields"]["velocity"][field_idx, start_idx:stop_idx, :, :, 1]
+    else:
+        raise ValueError(f"Invalid field: {field}")
+
+    f.close()
+
+    data_dict = {}
+    for i in range(data.shape[0]):
+        data_dict[i] = data[i, :, :]
+
+    return data_dict
+
 
 # Generator that yields batches (internal, not prefetched)
 def _batch_generator(data, batch_size, dt=5, shuffle=True, seed=0):
