@@ -85,39 +85,51 @@ def make_step(model, optimizer, opt_state, x, key, commitment_weight=0.25):
 
 
 def update_codebook_ema_multiscale(model, updates: tuple, indices_list: tp.List, key=None):
-    """Update codebook using EMA for multi-scale VAR model."""
-    avg_updates = jax.tree.map(lambda x: jnp.mean(x, axis=0), updates)
+    """Update codebook using EMA for multi-scale VAR model.
 
-    # Normalize cluster_size to get probability distribution
-    n_total = jnp.sum(avg_updates[0])
-    h = avg_updates[0] / n_total
+    Args:
+        model: VARVQVAE2d model
+        updates: Tuple of n_scales tuples, each (cluster_size, codebook_avg, codebook),
+                 with a leading batch dimension from vmap.
+        indices_list: List of per-scale indices (unused but kept for API compatibility)
+        key: PRNG key for dead-code reinitialization
+    """
+    n_scales = len(model.quantizer.scales)
+    keys = jax.random.split(key, n_scales)
 
-    # Reinitialize codes that deviate too much from uniform usage
-    part_that_should_be = 1 / model.quantizer.K
-    mask = (h < 0.25 * part_that_should_be) #"""(h > 2 * part_that_should_be) |""" 
-    rand_embed = (
-        jax.random.normal(key, (model.quantizer.K, model.quantizer.D)) * mask[:, None]
-    )
+    new_codebooks = []
+    new_codebook_avgs = []
+    new_cluster_sizes = []
 
-    # --- FIX START (Identical logic to single scale) ---
-    target_size = n_total / model.quantizer.K
-    new_cluster_size = jnp.where(mask, target_size, avg_updates[0])
+    for k in range(n_scales):
+        # Average over batch dimension for this scale's updates
+        avg_k = jax.tree.map(lambda x: jnp.mean(x, axis=0), updates[k])
 
-    new_codebook_avg = jnp.where(
-        mask[:, None],
-        rand_embed * new_cluster_size[:, None],
-        avg_updates[1]
-    )
+        # Normalize cluster_size to get probability distribution
+        n_total = jnp.sum(avg_k[0])
+        h = avg_k[0] / n_total
 
-    new_codebook = jnp.where(mask[:, None], rand_embed, avg_updates[2])
+        # Reinitialize codes that are under-used
+        part_that_should_be = 1 / model.quantizer.K
+        mask = (h < 0.25 * part_that_should_be)
+        rand_embed = (
+            jax.random.normal(keys[k], (model.quantizer.K, model.quantizer.D)) * mask[:, None]
+        )
 
-    avg_updates = (new_cluster_size, new_codebook_avg, new_codebook)
-    # --- FIX END ---
+        target_size = n_total / model.quantizer.K
+        cs = jnp.where(mask, target_size, avg_k[0])
+        ca = jnp.where(mask[:, None], rand_embed * cs[:, None], avg_k[1])
+        cb = jnp.where(mask[:, None], rand_embed, avg_k[2])
+
+        new_cluster_sizes.append(cs)
+        new_codebook_avgs.append(ca)
+        new_codebooks.append(cb)
 
     def where(q):
-        return q.quantizer.cluster_size, q.quantizer.codebook_avg, q.quantizer.codebook
+        return q.quantizer.codebooks, q.quantizer.codebook_avgs, q.quantizer.cluster_sizes
 
-    model = eqx.tree_at(where, model, avg_updates)
+    model = eqx.tree_at(where, model,
+                         (tuple(new_codebooks), tuple(new_codebook_avgs), tuple(new_cluster_sizes)))
     return model
 
 

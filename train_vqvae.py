@@ -273,23 +273,34 @@ def main():
             # Count unique codes used
             if args.var_mode:
                 # indices_out is a list of arrays for each scale
-                all_indices = np.concatenate([np.array(idx).flatten() for idx in indices_out])
-                unique_codes = len(np.unique(all_indices))
+                per_scale_unique = []
+                for idx in indices_out:
+                    per_scale_unique.append(len(np.unique(np.array(idx).flatten())))
+                unique_codes = sum(per_scale_unique)
             else:
                 unique_codes = len(np.unique(np.array(indices_out)))
 
             # Log to wandb
             if WANDB_AVAILABLE:
-                wandb.log({
+                log_dict = {
                     "loss/total": float(total_loss),
                     "loss/reconstruction": float(recon_loss),
                     "loss/commitment": float(commit_loss),
                     "codebook/unique_codes": unique_codes,
                     "step": global_step,
-                })
+                }
+                if args.var_mode:
+                    for si, s in enumerate(scales):
+                        log_dict[f"codebook/unique_codes_scale_{s}x{s}"] = per_scale_unique[si]
+                        log_dict[f"codebook/utilization_scale_{s}x{s}"] = per_scale_unique[si] / args.vocab_size
+                wandb.log(log_dict)
 
             if batch_idx % 50 == 0:
-                print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes}")
+                if args.var_mode:
+                    scale_str = " ".join(f"{s}:{n}" for s, n in zip(scales, per_scale_unique))
+                    print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes} [{scale_str}]")
+                else:
+                    print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes}")
 
                 # Log reconstructions and codebook usage
                 if WANDB_AVAILABLE:

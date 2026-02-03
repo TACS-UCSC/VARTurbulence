@@ -445,17 +445,17 @@ class MultiScaleQuantizer2d(eqx.Module):
     """Multi-scale residual quantizer for VAR-style VQ-VAE.
 
     Progressively quantizes residuals at increasing resolutions (e.g., 1x1 → 2x2 → 4x4 → 8x8 → 16x16).
-    Each scale captures detail that previous scales couldn't represent.
+    Each scale has its own independent codebook, capturing scale-specific detail.
     """
     scales: tuple = eqx.static_field()  # e.g., (1, 2, 4, 8, 16)
     target_size: int = eqx.static_field()  # target resolution (16 for 16x16 latent)
     K: int = eqx.static_field()  # vocab_size
     D: int = eqx.static_field()  # codebook_dim
 
-    codebook: jax.Array  # [K, D] shared across scales
+    codebooks: tuple  # tuple of n_scales arrays, each [K, D]
     phi_convs: tuple  # per-scale 3x3 convolutions
-    codebook_avg: jax.Array
-    cluster_size: jax.Array
+    codebook_avgs: tuple  # tuple of n_scales arrays, each [K, D]
+    cluster_sizes: tuple  # tuple of n_scales arrays, each [K]
 
     decay: float = eqx.static_field()
     eps: float = eqx.static_field()
@@ -476,19 +476,29 @@ class MultiScaleQuantizer2d(eqx.Module):
         self.decay = decay
         self.eps = eps
 
-        keys = jax.random.split(key, len(scales) + 1)
+        n_scales = len(scales)
+        # n_scales keys for codebooks + n_scales keys for phi_convs
+        keys = jax.random.split(key, 2 * n_scales)
 
-        # Shared codebook
-        self.codebook = jax.nn.initializers.variance_scaling(
-            scale=1.0, mode="fan_in", distribution="uniform"
-        )(keys[0], (vocab_size, codebook_dim))
-        self.codebook_avg = jnp.copy(self.codebook)
-        self.cluster_size = jnp.zeros(vocab_size)
+        # Per-scale codebooks
+        codebooks = []
+        codebook_avgs = []
+        cluster_sizes = []
+        for k in range(n_scales):
+            cb = jax.nn.initializers.variance_scaling(
+                scale=1.0, mode="fan_in", distribution="uniform"
+            )(keys[k], (vocab_size, codebook_dim))
+            codebooks.append(cb)
+            codebook_avgs.append(jnp.copy(cb))
+            cluster_sizes.append(jnp.zeros(vocab_size))
+        self.codebooks = tuple(codebooks)
+        self.codebook_avgs = tuple(codebook_avgs)
+        self.cluster_sizes = tuple(cluster_sizes)
 
         # Per-scale convolutions
         phi_convs = []
-        for i, scale in enumerate(scales):
-            conv = nn.Conv2d(codebook_dim, codebook_dim, kernel_size=3, padding=1, key=keys[i + 1])
+        for i in range(n_scales):
+            conv = nn.Conv2d(codebook_dim, codebook_dim, kernel_size=3, padding=1, key=keys[n_scales + i])
             phi_convs.append(conv)
         self.phi_convs = tuple(phi_convs)
 
@@ -500,7 +510,7 @@ class MultiScaleQuantizer2d(eqx.Module):
 
         Returns:
             z_q: Quantized output [D, H, W]
-            codebook_updates: Tuple of (cluster_size, codebook_avg, codebook) updates
+            codebook_updates: Tuple of n_scales tuples, each (cluster_size, codebook_avg, codebook)
             indices_list: List of indices for each scale
             commit_loss: Per-scale commitment loss (sum of MSE at each scale)
         """
@@ -510,8 +520,8 @@ class MultiScaleQuantizer2d(eqx.Module):
         r = x  # residual = encoder output
         quantized_sum = jnp.zeros_like(x)
         indices_list = []
-        all_flattens = []
-        all_indices = []
+        per_scale_flattens = []
+        per_scale_indices = []
         commit_loss = 0.0
 
         for k, scale in enumerate(self.scales):
@@ -521,11 +531,10 @@ class MultiScaleQuantizer2d(eqx.Module):
             # Per-scale convolution
             r_k = self.phi_convs[k](r_k)
 
-            # Quantize at this scale
-            z_q_k, flatten_k, indices_k = self._quantize_single(r_k)
+            # Quantize at this scale using that scale's codebook
+            z_q_k, flatten_k, indices_k = self._quantize_single(r_k, self.codebooks[k])
 
             # Per-scale commitment loss: encourage r_k to be close to quantized z_q_k
-            # z_q_k has straight-through gradients, so sg() gives the actual codebook values
             commit_loss = commit_loss + jnp.mean(
                 (r_k - jax.lax.stop_gradient(z_q_k)) ** 2
             )
@@ -538,19 +547,20 @@ class MultiScaleQuantizer2d(eqx.Module):
             r = x - quantized_sum  # residual for next scale
 
             indices_list.append(indices_k)
-            all_flattens.append(flatten_k)
-            all_indices.append(indices_k.flatten())
+            per_scale_flattens.append(flatten_k)
+            per_scale_indices.append(indices_k.flatten())
 
-        # Aggregate codebook updates across all scales
-        codebook_updates = self._aggregate_codebook_updates(all_flattens, all_indices)
+        # Compute independent codebook updates per scale
+        codebook_updates = self._per_scale_codebook_updates(per_scale_flattens, per_scale_indices)
 
         return quantized_sum, codebook_updates, indices_list, commit_loss
 
-    def _quantize_single(self, x):
+    def _quantize_single(self, x, codebook):
         """Quantize a single-scale feature map.
 
         Args:
             x: Feature map [D, H, W]
+            codebook: Codebook array [K, D] for this scale
 
         Returns:
             z_q: Quantized [D, H, W]
@@ -565,16 +575,16 @@ class MultiScaleQuantizer2d(eqx.Module):
 
         # Compute distances to codebook vectors
         a_squared = jnp.sum(flatten**2, axis=-1, keepdims=True)
-        b_squared = jnp.transpose(jnp.sum(self.codebook**2, axis=-1, keepdims=True))
+        b_squared = jnp.transpose(jnp.sum(codebook**2, axis=-1, keepdims=True))
         distance = (
             a_squared
             + b_squared
-            - 2 * jnp.matmul(flatten, jnp.transpose(self.codebook))
+            - 2 * jnp.matmul(flatten, jnp.transpose(codebook))
         )
 
         # Find nearest codebook vectors
         codebook_indices = jnp.argmin(distance, axis=-1)  # [H*W]
-        z_q = self.codebook[codebook_indices]  # [H*W, D]
+        z_q = codebook[codebook_indices]  # [H*W, D]
 
         # Straight-through estimator
         z_q = flatten + jax.lax.stop_gradient(z_q - flatten)
@@ -588,31 +598,38 @@ class MultiScaleQuantizer2d(eqx.Module):
 
         return z_q, flatten, indices
 
-    def _aggregate_codebook_updates(self, all_flattens, all_indices):
-        """Aggregate EMA updates across all scales."""
-        # Concatenate all flattened features and indices
-        concat_flatten = jnp.concatenate(all_flattens, axis=0)
-        concat_indices = jnp.concatenate(all_indices, axis=0)
+    def _per_scale_codebook_updates(self, per_scale_flattens, per_scale_indices):
+        """Compute independent EMA updates for each scale's codebook.
 
-        # Calculate usage
-        codebook_onehot = jax.nn.one_hot(concat_indices, self.K)
-        codebook_onehot_sum = jnp.sum(codebook_onehot, axis=0)
-        codebook_sum = jnp.dot(concat_flatten.T, codebook_onehot)
+        Returns:
+            Tuple of n_scales tuples, each (cluster_size, codebook_avg, codebook).
+        """
+        all_updates = []
+        for k in range(len(self.scales)):
+            flatten_k = per_scale_flattens[k]
+            indices_k = per_scale_indices[k]
 
-        # EMA updates
-        new_cluster_size = (
-            self.decay * self.cluster_size + (1 - self.decay) * codebook_onehot_sum
-        )
-        new_codebook_avg = (
-            self.decay * self.codebook_avg + (1 - self.decay) * codebook_sum.T
-        )
+            # Calculate usage for this scale
+            codebook_onehot = jax.nn.one_hot(indices_k, self.K)
+            codebook_onehot_sum = jnp.sum(codebook_onehot, axis=0)
+            codebook_sum = jnp.dot(flatten_k.T, codebook_onehot)
 
-        # Laplace smoothing and normalization
-        n = jnp.sum(new_cluster_size)
-        new_cluster_size_smooth = (new_cluster_size + self.eps) / (n + self.K * self.eps) * n
-        new_codebook = new_codebook_avg / new_cluster_size_smooth[:, None]
+            # EMA updates using this scale's state
+            new_cluster_size = (
+                self.decay * self.cluster_sizes[k] + (1 - self.decay) * codebook_onehot_sum
+            )
+            new_codebook_avg = (
+                self.decay * self.codebook_avgs[k] + (1 - self.decay) * codebook_sum.T
+            )
 
-        return (new_cluster_size, new_codebook_avg, new_codebook)
+            # Laplace smoothing and normalization
+            n = jnp.sum(new_cluster_size)
+            new_cluster_size_smooth = (new_cluster_size + self.eps) / (n + self.K * self.eps) * n
+            new_codebook = new_codebook_avg / new_cluster_size_smooth[:, None]
+
+            all_updates.append((new_cluster_size, new_codebook_avg, new_codebook))
+
+        return tuple(all_updates)
 
 
 class VARVQVAE2d(eqx.Module):
@@ -725,9 +742,9 @@ class VARVQVAE2d(eqx.Module):
         target_size = self.quantizer.target_size
         z_q = jnp.zeros((D, target_size, target_size))
 
-        for indices in indices_list:
+        for k, indices in enumerate(indices_list):
             H, W = indices.shape
-            z_q_k = self.quantizer.codebook[indices.flatten()]  # [H*W, D]
+            z_q_k = self.quantizer.codebooks[k][indices.flatten()]  # [H*W, D]
             z_q_k = jnp.reshape(z_q_k, (H, W, D))  # [H, W, D]
             z_q_k = jnp.transpose(z_q_k, (2, 0, 1))  # [D, H, W]
             z_q_k_up = jax.image.resize(z_q_k, (D, target_size, target_size), method="nearest")
