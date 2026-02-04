@@ -29,7 +29,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="NSP Video Rollout")
 
     # Checkpoints
-    parser.add_argument("--nsp_checkpoint", type=str, required=True,
+    parser.add_argument("--nsp_checkpoint", type=str, default=None,
                         help="Path to trained NSP model checkpoint")
     parser.add_argument("--vqvae_checkpoint", type=str, required=True,
                         help="Path to VQ-VAE checkpoint for decoding")
@@ -64,7 +64,14 @@ def parse_args():
     parser.add_argument("--data_start_idx", type=int, default=10000,
                         help="Start index used when creating tokens.npz")
 
-    return parser.parse_args()
+    # Reanalyze mode
+    parser.add_argument("--reanalyze", action="store_true",
+                        help="Skip generation; reload tokens from saved .npz files and rerun analysis")
+
+    args = parser.parse_args()
+    if not args.reanalyze and args.nsp_checkpoint is None:
+        parser.error("--nsp_checkpoint is required unless --reanalyze is set")
+    return args
 
 
 def load_tokenized_data(path: str) -> dict:
@@ -561,6 +568,149 @@ def save_video(gen_imgs, gt_imgs, output_path, fps=10):
     plt.close(fig)
 
 
+# =============================================================================
+# Spectral Analysis Functions
+# =============================================================================
+
+def setup_spectral_analysis(H, W):
+    """Set up wavenumber grids and precompute radial bin masks."""
+    kx = np.fft.fftfreq(W, d=1.0) * 2 * np.pi
+    ky = np.fft.fftfreq(H, d=1.0) * 2 * np.pi
+    Kx, Ky = np.meshgrid(kx, ky)
+    Ksq = Kx**2 + Ky**2
+
+    k_mag = np.sqrt(Ksq)
+    k_max = np.max(k_mag)
+    n_bins = min(H // 2, W // 2)
+    k_bins = np.linspace(0, k_max, n_bins)
+    k_centers = 0.5 * (k_bins[1:] + k_bins[:-1])
+
+    bin_masks = []
+    for i in range(len(k_centers)):
+        if i == 0:
+            bin_masks.append(k_mag <= k_bins[1])
+        else:
+            bin_masks.append((k_mag > k_bins[i]) & (k_mag <= k_bins[i + 1]))
+
+    return Kx, Ky, Ksq, k_centers, bin_masks
+
+
+def radial_average(density_2d, bin_masks):
+    """Radially average a 2D spectral density field using precomputed bin masks."""
+    spectrum = np.zeros(len(bin_masks))
+    for i, mask in enumerate(bin_masks):
+        if np.any(mask):
+            spectrum[i] = np.mean(density_2d[mask])
+    return spectrum
+
+
+def compute_tke_spectrum(omega, Kx, Ky, Ksq, bin_masks):
+    """Compute radially-averaged TKE spectrum E(k) from a vorticity field."""
+    omega_hat = np.fft.fft2(omega)
+    psi_hat = np.zeros_like(omega_hat, dtype=complex)
+    nonzero = Ksq > 0
+    psi_hat[nonzero] = omega_hat[nonzero] / Ksq[nonzero]
+
+    u_hat = 1j * Ky * psi_hat
+    v_hat = 1j * Kx * psi_hat
+    KE_density = 0.5 * (np.abs(u_hat)**2 + np.abs(v_hat)**2)
+
+    return radial_average(KE_density, bin_masks)
+
+
+def compute_enstrophy_spectrum(omega, bin_masks):
+    """Compute radially-averaged enstrophy spectrum Z(k) from a vorticity field."""
+    omega_hat = np.fft.fft2(omega)
+    enstrophy_density = 0.5 * np.abs(omega_hat)**2
+    return radial_average(enstrophy_density, bin_masks)
+
+
+def compute_spectra_for_trajectory(images, Kx, Ky, Ksq, bin_masks):
+    """Compute TKE and enstrophy spectra for each frame in a trajectory.
+
+    Args:
+        images: [T, H, W] vorticity fields
+
+    Returns:
+        tke_spectra: [T, n_bins]
+        enstrophy_spectra: [T, n_bins]
+    """
+    tke_list = []
+    ens_list = []
+    for t in range(len(images)):
+        tke_list.append(compute_tke_spectrum(images[t], Kx, Ky, Ksq, bin_masks))
+        ens_list.append(compute_enstrophy_spectrum(images[t], bin_masks))
+    return np.array(tke_list), np.array(ens_list)
+
+
+def plot_spectral_milestones(k_centers, raw_gt_spec, recon_gt_spec, gen_spec,
+                             milestone_steps, spectrum_type, ylabel, output_path):
+    """Plot per-milestone spectral comparison with 3 curves per subplot."""
+    n_plots = len(milestone_steps)
+    ncols = min(3, n_plots)
+    nrows = (n_plots + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for i, t in enumerate(milestone_steps):
+        ax = axes_flat[i]
+        valid_k = k_centers > 0
+
+        for spec, label, color, ls in [
+            (raw_gt_spec[t], 'Raw GT', 'blue', '-'),
+            (recon_gt_spec[t], 'Recon GT', 'green', '--'),
+            (gen_spec[t], 'Generated', 'red', ':'),
+        ]:
+            mask = valid_k & (spec > 0)
+            if np.any(mask):
+                ax.loglog(k_centers[mask], spec[mask],
+                         label=label, color=color, linestyle=ls, alpha=0.8, linewidth=1.5)
+
+        ax.set_title(f"t = {t}")
+        ax.set_xlabel("Wavenumber |k|")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, which='both', linestyle='--', alpha=0.3)
+        ax.legend(fontsize=9)
+
+    for j in range(n_plots, len(axes_flat)):
+        fig.delaxes(axes_flat[j])
+
+    fig.suptitle(f"{spectrum_type} Spectrum Comparison", fontsize=14)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {spectrum_type} milestone plot to {output_path}")
+
+
+def plot_spectral_time_averaged(k_centers, raw_gt_spec, recon_gt_spec, gen_spec,
+                                spectrum_type, ylabel, output_path):
+    """Plot time-averaged spectral comparison."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    valid_k = k_centers > 0
+
+    for spec, label, color, ls in [
+        (raw_gt_spec, 'Raw GT', 'blue', '-'),
+        (recon_gt_spec, 'Recon GT', 'green', '--'),
+        (gen_spec, 'Generated', 'red', ':'),
+    ]:
+        mask = valid_k & (spec > 0)
+        if np.any(mask):
+            ax.loglog(k_centers[mask], spec[mask],
+                     label=label, color=color, linestyle=ls, alpha=0.8, linewidth=2)
+
+    ax.set_title(f"Time-Averaged {spectrum_type} Spectrum")
+    ax.set_xlabel("Wavenumber |k|")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, which='both', linestyle='--', alpha=0.3)
+    ax.legend(fontsize=11)
+
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved time-averaged {spectrum_type} plot to {output_path}")
+
+
 def main():
     args = parse_args()
 
@@ -602,11 +752,16 @@ def main():
     )
 
     # 3. Model
-    print(f"Loading NSP model from {args.nsp_checkpoint}...")
-    key, model_key = jax.random.split(key)
-    model = NextScalePredictor(config, codebook, model_key)
-    model = eqx.tree_deserialise_leaves(args.nsp_checkpoint, model)
-    attn_bias = build_temporal_mask(config.scales, config.padded_seq_len)
+    if not args.reanalyze:
+        print(f"Loading NSP model from {args.nsp_checkpoint}...")
+        key, model_key = jax.random.split(key)
+        model = NextScalePredictor(config, codebook, model_key)
+        model = eqx.tree_deserialise_leaves(args.nsp_checkpoint, model)
+        attn_bias = build_temporal_mask(config.scales, config.padded_seq_len)
+    else:
+        print("Reanalyze mode: skipping NSP model loading")
+        model = None
+        attn_bias = None
 
     # 4. Tokenizer
     print(f"Loading VQ-VAE from {args.vqvae_checkpoint}...")
@@ -641,6 +796,13 @@ def main():
             stop_idx=max_raw_idx
         )
 
+    # 5b. Setup spectral analysis grids
+    spectral_grids = None
+    all_sample_spectra = []
+    if raw_data is not None:
+        H_img = W_img = 256
+        spectral_grids = setup_spectral_analysis(H_img, W_img)
+
     # 6. Loop & Generate Videos
     print(f"\nGenerating {args.n_samples} video trajectories...")
 
@@ -654,36 +816,49 @@ def main():
     all_raw_gt_pixels = []
 
     for i in range(args.n_samples):
-        # Select start index
         idx = args.start_idx + i * (args.n_steps + 100)
-        if idx + args.n_steps >= len(all_indices):
-            print("Dataset exhausted.")
-            break
 
-        print(f"\n--- Sample {i+1}/{args.n_samples} (Start Index {idx}) ---")
+        if args.reanalyze:
+            # Load previously saved tokens
+            token_file = os.path.join(tokens_dir, f"tokens_sample_{i}.npz")
+            if not os.path.exists(token_file):
+                print(f"Token file {token_file} not found, stopping.")
+                break
 
-        # Get data
-        t0_frame = jnp.array(all_indices[idx])
-        gt_traj_tokens = jnp.array(all_indices[idx : idx + args.n_steps + 1])
+            print(f"\n--- Sample {i+1}/{args.n_samples} (Reanalyze, Start Index {idx}) ---")
+            saved = np.load(token_file)
+            gen_traj_tokens = jnp.array(saved["gen_tokens"])
+            gt_traj_tokens = jnp.array(saved["gt_tokens"])
+        else:
+            # Normal generation path
+            if idx + args.n_steps >= len(all_indices):
+                print("Dataset exhausted.")
+                break
 
-        # Generate
-        key, traj_key = jax.random.split(key)
-        gen_traj_tokens = generate_trajectory(
-            model, config, codebook, t0_frame, attn_bias,
-            n_steps=args.n_steps, key=traj_key,
-            temperature=args.temperature, top_k=args.top_k
-        )
+            print(f"\n--- Sample {i+1}/{args.n_samples} (Start Index {idx}) ---")
+
+            # Get data
+            t0_frame = jnp.array(all_indices[idx])
+            gt_traj_tokens = jnp.array(all_indices[idx : idx + args.n_steps + 1])
+
+            # Generate
+            key, traj_key = jax.random.split(key)
+            gen_traj_tokens = generate_trajectory(
+                model, config, codebook, t0_frame, attn_bias,
+                n_steps=args.n_steps, key=traj_key,
+                temperature=args.temperature, top_k=args.top_k
+            )
+
+            # Save token trajectory
+            token_out = os.path.join(tokens_dir, f"tokens_sample_{i}.npz")
+            save_token_trajectory(
+                gen_traj_tokens, gt_traj_tokens, token_out,
+                scales, config.scale_offsets
+            )
 
         # Accumulate for statistics
         all_gen_trajectories.append(np.array(gen_traj_tokens))
         all_gt_trajectories.append(np.array(gt_traj_tokens))
-
-        # Save token trajectory
-        token_out = os.path.join(tokens_dir, f"tokens_sample_{i}.npz")
-        save_token_trajectory(
-            gen_traj_tokens, gt_traj_tokens, token_out,
-            scales, config.scale_offsets
-        )
 
         # Decode to images [T, H, W]
         print("  Decoding frames...")
@@ -715,6 +890,24 @@ def main():
             all_gen_pixels.append(gen_imgs.flatten())
             all_recon_gt_pixels.append(recon_gt_imgs.flatten())
             all_raw_gt_pixels.append(raw_gt_imgs.flatten())
+
+            # Compute spectra for all three image types
+            if spectral_grids is not None:
+                Kx_g, Ky_g, Ksq_g, sp_k_centers, sp_bin_masks = spectral_grids
+                n_frames = min(len(raw_gt_imgs), len(recon_gt_imgs), len(gen_imgs))
+                print(f"  Computing spectra ({n_frames} frames)...")
+
+                raw_tke, raw_ens = compute_spectra_for_trajectory(
+                    raw_gt_imgs[:n_frames], Kx_g, Ky_g, Ksq_g, sp_bin_masks)
+                recon_tke, recon_ens = compute_spectra_for_trajectory(
+                    recon_gt_imgs[:n_frames], Kx_g, Ky_g, Ksq_g, sp_bin_masks)
+                gen_tke, gen_ens = compute_spectra_for_trajectory(
+                    gen_imgs[:n_frames], Kx_g, Ky_g, Ksq_g, sp_bin_masks)
+
+                all_sample_spectra.append({
+                    'raw_gt_tke': raw_tke, 'recon_gt_tke': recon_tke, 'gen_tke': gen_tke,
+                    'raw_gt_ens': raw_ens, 'recon_gt_ens': recon_ens, 'gen_ens': gen_ens,
+                })
 
     # 7. Compute aggregate token statistics across all samples
     if all_gen_trajectories:
@@ -787,12 +980,69 @@ def main():
         print(f"  Recon GT vs Raw GT: JS={pixel_metrics['recon_gt_vs_raw_gt']['js_divergence']:.4f}, "
               f"TV={pixel_metrics['recon_gt_vs_raw_gt']['tv_distance']:.4f}")
 
+    # 9. Spectral analysis (if raw data available)
+    if all_sample_spectra:
+        print("\n--- Computing Spectral Analysis ---")
+        spectra_dir = os.path.join(args.output_dir, "spectra")
+        os.makedirs(spectra_dir, exist_ok=True)
+
+        Kx_g, Ky_g, Ksq_g, sp_k_centers, sp_bin_masks = spectral_grids
+        min_T = min(s['raw_gt_tke'].shape[0] for s in all_sample_spectra)
+
+        # Average spectra across samples: [T, n_bins]
+        raw_gt_tke_avg = np.mean(
+            np.stack([s['raw_gt_tke'][:min_T] for s in all_sample_spectra]), axis=0)
+        recon_gt_tke_avg = np.mean(
+            np.stack([s['recon_gt_tke'][:min_T] for s in all_sample_spectra]), axis=0)
+        gen_tke_avg = np.mean(
+            np.stack([s['gen_tke'][:min_T] for s in all_sample_spectra]), axis=0)
+        raw_gt_ens_avg = np.mean(
+            np.stack([s['raw_gt_ens'][:min_T] for s in all_sample_spectra]), axis=0)
+        recon_gt_ens_avg = np.mean(
+            np.stack([s['recon_gt_ens'][:min_T] for s in all_sample_spectra]), axis=0)
+        gen_ens_avg = np.mean(
+            np.stack([s['gen_ens'][:min_T] for s in all_sample_spectra]), axis=0)
+
+        print(f"  Averaged over {len(all_sample_spectra)} samples, {min_T} timesteps each")
+
+        # Milestone plots at selected timesteps
+        milestone_steps = [0, 1, 4, 9, 24, 49, 99]
+        milestone_steps = [t for t in milestone_steps if t < min_T]
+
+        plot_spectral_milestones(
+            sp_k_centers, raw_gt_tke_avg, recon_gt_tke_avg, gen_tke_avg,
+            milestone_steps, "TKE", "E(k)",
+            os.path.join(spectra_dir, "tke_spectrum_milestones.png"))
+
+        plot_spectral_milestones(
+            sp_k_centers, raw_gt_ens_avg, recon_gt_ens_avg, gen_ens_avg,
+            milestone_steps, "Enstrophy", "Z(k)",
+            os.path.join(spectra_dir, "enstrophy_spectrum_milestones.png"))
+
+        # Time-averaged plots (average across all timesteps)
+        plot_spectral_time_averaged(
+            sp_k_centers,
+            np.mean(raw_gt_tke_avg, axis=0),
+            np.mean(recon_gt_tke_avg, axis=0),
+            np.mean(gen_tke_avg, axis=0),
+            "TKE", "E(k)",
+            os.path.join(spectra_dir, "tke_spectrum_time_averaged.png"))
+
+        plot_spectral_time_averaged(
+            sp_k_centers,
+            np.mean(raw_gt_ens_avg, axis=0),
+            np.mean(recon_gt_ens_avg, axis=0),
+            np.mean(gen_ens_avg, axis=0),
+            "Enstrophy", "Z(k)",
+            os.path.join(spectra_dir, "enstrophy_spectrum_time_averaged.png"))
+
     print(f"\nDone. Results saved to {args.output_dir}/")
     print(f"  videos/       - Side-by-side rollout videos")
     print(f"  tokens/       - Token trajectories (.npz)")
     print(f"  stats/        - Histograms and metrics")
     if args.data_dir:
         print(f"  comparisons/  - Raw GT | Recon GT | Gen comparison grids")
+        print(f"  spectra/      - TKE and enstrophy spectral analysis")
 
 if __name__ == "__main__":
     main()
