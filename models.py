@@ -139,6 +139,7 @@ class Encoder2d(eqx.Module):
 
     def __init__(
         self,
+        in_channels: int = 1,
         hidden_dim: int = 512,
         codebook_dim: int = 64,
         base_channels: int = 128,
@@ -151,6 +152,7 @@ class Encoder2d(eqx.Module):
     ):
         """
         Args:
+            in_channels: Number of input channels
             hidden_dim: Channels at bottleneck (before projection)
             codebook_dim: Output channels (latent dimension)
             base_channels: Base channel count, multiplied by channel_mult
@@ -165,9 +167,9 @@ class Encoder2d(eqx.Module):
         total_blocks = 1 + num_stages * (1 + num_res_blocks) + num_res_blocks + 2
         keys = iter(jax.random.split(key, total_blocks + 5))
 
-        # Initial conv: 1 -> base_channels
+        # Initial conv: in_channels -> base_channels
         ch_in = base_channels * channel_mult[0]
-        self.in_conv = nn.Conv2d(1, ch_in, kernel_size=3, stride=2, padding=1, key=next(keys))
+        self.in_conv = nn.Conv2d(in_channels, ch_in, kernel_size=3, stride=2, padding=1, key=next(keys))
 
         # Build stages
         stages = []
@@ -248,6 +250,7 @@ class Decoder2d(eqx.Module):
 
     def __init__(
         self,
+        out_channels: int = 1,
         hidden_dim: int = 512,
         codebook_dim: int = 64,
         base_channels: int = 128,
@@ -260,6 +263,7 @@ class Decoder2d(eqx.Module):
     ):
         """
         Args:
+            out_channels: Number of output channels
             hidden_dim: Channels at bottleneck (after projection)
             codebook_dim: Input channels (latent dimension)
             base_channels: Base channel count, multiplied by channel_mult
@@ -323,7 +327,7 @@ class Decoder2d(eqx.Module):
             self.norm_out = nn.GroupNorm(groups=min(32, ch_final), channels=ch_final)
         else:
             self.norm_out = None
-        self.out_conv = nn.Conv2d(ch_final, 1, kernel_size=3, padding=1, key=next(keys))
+        self.out_conv = nn.Conv2d(ch_final, out_channels, kernel_size=3, padding=1, key=next(keys))
 
     def __call__(self, x):
         y = self.proj(x)
@@ -623,6 +627,7 @@ class VARVQVAE2d(eqx.Module):
 
     def __init__(
         self,
+        channels: int = 1,
         hidden_dim: int = 512,
         codebook_dim: int = 64,
         vocab_size: int = 4096,
@@ -639,6 +644,7 @@ class VARVQVAE2d(eqx.Module):
     ):
         """
         Args:
+            channels: Number of input/output channels
             hidden_dim: Legacy param, unused with new architecture
             codebook_dim: Latent dimension per spatial position
             vocab_size: Number of codebook vectors
@@ -654,6 +660,7 @@ class VARVQVAE2d(eqx.Module):
         key1, key2, key3 = jax.random.split(key, 3)
 
         self.encoder = Encoder2d(
+            in_channels=channels,
             hidden_dim=hidden_dim,
             codebook_dim=codebook_dim,
             base_channels=base_channels,
@@ -665,6 +672,7 @@ class VARVQVAE2d(eqx.Module):
             key=key1,
         )
         self.decoder = Decoder2d(
+            out_channels=channels,
             hidden_dim=hidden_dim,
             codebook_dim=codebook_dim,
             base_channels=base_channels,
@@ -744,6 +752,7 @@ class VQVAE2d(eqx.Module):
 
     def __init__(
         self,
+        channels: int = 1,
         hidden_dim: int = 512,
         codebook_dim: int = 64,
         vocab_size: int = 512,
@@ -759,6 +768,7 @@ class VQVAE2d(eqx.Module):
     ):
         """
         Args:
+            channels: Number of input/output channels
             hidden_dim: Legacy param, unused with new architecture
             codebook_dim: Latent dimension per spatial position
             vocab_size: Number of codebook vectors
@@ -773,6 +783,7 @@ class VQVAE2d(eqx.Module):
         key1, key2, key3 = jax.random.split(key, 3)
 
         self.encoder = Encoder2d(
+            in_channels=channels,
             hidden_dim=hidden_dim,
             codebook_dim=codebook_dim,
             base_channels=base_channels,
@@ -784,6 +795,7 @@ class VQVAE2d(eqx.Module):
             key=key1,
         )
         self.decoder = Decoder2d(
+            out_channels=channels,
             hidden_dim=hidden_dim,
             codebook_dim=codebook_dim,
             base_channels=base_channels,
