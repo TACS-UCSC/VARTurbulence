@@ -63,7 +63,85 @@ Expects `.mat` files containing a variable named `Omega` with shape `(256, 256)`
 | `trainer.py` | Training step with loss computation and EMA codebook updates |
 | `dataloaders.py` | Data loading from MATLAB files with prefetching |
 | `train_vqvae.py` | Main training script with wandb integration |
+| `tokenizer.py` | Tokenization pipeline for AR model training |
+| `nsp_model.py` | Next-Scale Prediction model (NextScalePredictor, block-causal attention) |
+| `train_nsp.py` | NSP training script with per-scale loss and wandb logging |
+| `eval_nsp.py` | NSP evaluation: iterative generation, VQ-VAE decoding, metrics |
+
+## Tokenization
+
+The `tokenizer.py` module wraps a trained VQ-VAE to prepare data for autoregressive model training.
+
+**VQVAETokenizer class**:
+- Loads trained VQ-VAE checkpoint (supports VQVAE2d and VARVQVAE2d)
+- `fit()` scans dataset to collect used codebook indices
+- **Standard VQ-VAE**: Remaps sparse codebook usage to consecutive indices
+- **VAR mode**: Builds unified per-scale codebook with contiguous index ranges per scale
+
+**Usage**:
+```bash
+# Show tokenizer stats
+python tokenizer.py info --checkpoint model.eqx --data_dir /path/to/data --var_mode
+
+# Tokenize and save to file
+python tokenizer.py save --checkpoint model.eqx --data_dir /path/to/data --output tokens.npz --var_mode
+```
+
+**Output format** (`.npz`):
+- `indices_flat`: [N, total_tokens] discrete token indices
+- `vectors_flat`: [N, total_tokens, codebook_dim] corresponding codebook vectors
+- `codebook`: unified codebook for AR model embedding layer
+- `scale_offsets`: [n_scales] start of each scale's range in unified vocab (VAR mode)
+- `scale_vocab_sizes`: [n_scales] unique tokens per scale (VAR mode)
+
+## Next-Scale Prediction (NSP) Model
+
+The NSP model predicts all tokens in a scale simultaneously, conditioned on all coarser scales via block-causal attention.
+
+**Architecture**:
+- Block-causal attention: each scale can only attend to strictly earlier scales
+- Frozen codebook embedding with learnable projection + mask token
+- Per-scale classification heads (one per trainable scale)
+- Scales 0-3 (1x1 through 4x4) are deterministic; scales 4-9 are predicted
+- Temporal modeling: t1 is predicted conditioned on t0 (full context) and coarser scales of t1
+
+**Training**:
+```bash
+python train_nsp.py --tokens_path tokens.npz --vqvae_checkpoint model.eqx --epochs 100
+```
+
+Key arguments:
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--n_layer` | 6 | Number of transformer layers |
+| `--n_head` | 8 | Number of attention heads |
+| `--n_embd` | 256 | Embedding dimension |
+| `--optimizer` | lion | Optimizer (lion, adamw, adafactor) |
+| `--lr` | 1e-4 | Learning rate |
+
+**Evaluation**:
+```bash
+python eval_nsp.py --nsp_checkpoint nsp_model.eqx --vqvae_checkpoint model.eqx \
+    --tokens_path tokens.npz --n_samples 4 --n_steps 100
+```
+
+Generates autoregressive video rollouts (t0 -> t100), decodes through VQ-VAE, and produces:
+- Side-by-side videos (Generated vs GT)
+- Per-scale token distribution histograms
+- Pixel-space comparison grids (if raw data provided)
+- JS divergence and TV distance metrics
 
 ## Logging
 
 Training metrics are logged to [Weights & Biases](https://wandb.ai) if installed. Disable by uninstalling wandb or running offline.
+
+## Dependencies
+
+- JAX
+- Equinox
+- Optax
+- scipy (for loading .mat files)
+- h5py (for loading HDF5 datasets)
+- PyTorch CPU (`torch`, for HDF5 dataloader)
+- matplotlib (for visualization)
+- wandb (optional, for logging)

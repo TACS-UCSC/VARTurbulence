@@ -22,7 +22,7 @@ from nsp_model import (
     build_temporal_mask,
 )
 from tokenizer import VQVAETokenizer, load_vqvae_checkpoint
-from dataloaders import load_turbulence_data
+from dataloaders import load_turbulence_data_mat
 
 
 def parse_args():
@@ -790,7 +790,7 @@ def main():
 
         print(f"\nLoading raw .mat files from {args.data_dir}...")
         print(f"  Range: {args.data_start_idx} to {max_raw_idx}")
-        raw_data = load_turbulence_data(
+        raw_data = load_turbulence_data_mat(
             args.data_dir,
             start_idx=args.data_start_idx,
             stop_idx=max_raw_idx

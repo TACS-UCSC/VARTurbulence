@@ -306,7 +306,7 @@ class VQVAETokenizer:
         gets its own contiguous index range in the unified vocabulary.
 
         Args:
-            data: Dictionary mapping indices to vorticity arrays (from load_turbulence_data)
+            data: Dictionary mapping indices to vorticity arrays (from load_turbulence_data_mat)
             batch_size: Batch size for processing
 
         Returns:
@@ -598,7 +598,7 @@ def save_tokenized_data(
     Args:
         path: Output path for .npz file
         tokenizer: Fitted VQVAETokenizer
-        data: Data dictionary from load_turbulence_data
+        data: Data dictionary from load_turbulence_data_mat
         config: Model configuration dict
         batch_size: Batch size for processing
     """
@@ -910,10 +910,10 @@ def main():
     config = build_config_from_args(args)
 
     # Load data
-    from dataloaders import load_turbulence_data
+    from dataloaders import load_turbulence_data_mat
 
     print("Loading turbulence data...")
-    data = load_turbulence_data(
+    data = load_turbulence_data_mat(
         args.data_dir, start_idx=args.start_idx, stop_idx=args.stop_idx
     )
     print(f"Loaded {len(data)} samples")

@@ -16,7 +16,7 @@ except ImportError:
 
 from models import VQVAE2d, VARVQVAE2d
 from trainer import make_step, make_step_var
-from dataloaders import load_turbulence_data, create_turbulence_dataloader
+from dataloaders import load_turbulence_data_mat, create_turbulence_dataloader
 
 
 def parse_args():
@@ -112,7 +112,7 @@ def main():
 
     # Load data
     print("Loading turbulence data...")
-    data = load_turbulence_data(
+    data = load_turbulence_data_mat(
         args.data_dir,
         start_idx=args.start_idx,
         stop_idx=args.stop_idx,
