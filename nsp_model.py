@@ -300,7 +300,7 @@ class BlockCausalAttention(eqx.Module):
             bias=bias,
             implementation='cudnn'
         )
-        y = y.astype(jnp.float32).reshape(T, C)
+        y = y.reshape(T, C)
         y = jax.vmap(self.c_proj)(y)
         
         if key is not None:
@@ -316,7 +316,9 @@ class MLP(eqx.Module):
 
     def __init__(self, config: NextScalePredConfig, key):
         k1, k2, k3 = jax.random.split(key, 3)
-        hidden_dim = 4 * config.n_embd
+        hidden_dim = (4 * config.n_embd * 2) // 3
+        # Round up to multiple of 64 for hardware efficiency
+        hidden_dim = ((hidden_dim + 63) // 64) * 64
         self.gate_proj = eqx.nn.Linear(config.n_embd, hidden_dim, use_bias=False, key=k1)
         self.up_proj   = eqx.nn.Linear(config.n_embd, hidden_dim, use_bias=False, key=k2)
         self.down_proj = eqx.nn.Linear(hidden_dim, config.n_embd, use_bias=False, key=k3)
@@ -404,8 +406,6 @@ class NextScalePredictor(eqx.Module):
             attn_bias: [2 * padded_len, 2 * padded_len] temporal mask
         """
         x = self.embedding(tokens, mask_positions)
-        #hardcoded mixed precision
-        x = x.astype(jnp.bfloat16)
         if key is not None:
             key, drop_key = jax.random.split(key)
             x = self.drop(x, key=drop_key)
@@ -420,7 +420,7 @@ class NextScalePredictor(eqx.Module):
             x = eqx.filter_checkpoint(block)(x, attn_bias, key=block_key)
 
         x = jax.vmap(self.ln_f)(x)
-        return x.astype(jnp.float32)
+        return x
 
     def predict_scale(self, hidden_states: jax.Array,
                       target_scale_idx: int) -> jax.Array:

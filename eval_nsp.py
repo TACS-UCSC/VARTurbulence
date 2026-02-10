@@ -874,11 +874,11 @@ def main():
             # Load raw GT images for this trajectory
             raw_gt_imgs = []
             for t in range(args.n_steps + 1):
-                raw_idx = args.data_start_idx + idx + t
-                if raw_idx in raw_data:
-                    raw_gt_imgs.append(raw_data[raw_idx])
+                array_idx = idx + t
+                if array_idx < len(raw_data):
+                    raw_gt_imgs.append(raw_data[array_idx, 0])  # [0] removes channel dim
                 else:
-                    print(f"  Warning: Missing raw data index {raw_idx}")
+                    print(f"  Warning: Missing raw data array index {array_idx}")
                     break
             raw_gt_imgs = np.stack(raw_gt_imgs)
 

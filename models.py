@@ -11,7 +11,7 @@ class ResBlock2d(eqx.Module):
     conv2: nn.Conv2d
     norm1: tp.Optional[nn.GroupNorm]
     norm2: tp.Optional[nn.GroupNorm]
-    use_norm: bool = eqx.static_field()
+    use_norm: bool = eqx.field(static=True)
 
     def __init__(self, dim: int, use_norm: bool = False, num_groups: int = 32, key=None):
         key1, key2 = jax.random.split(key, 2)
@@ -43,9 +43,9 @@ class ResBlock2d(eqx.Module):
 
 class SelfAttention2d(eqx.Module):
     """Self-attention for 2D feature maps."""
-    num_heads: int = eqx.static_field()
-    head_dim: int = eqx.static_field()
-    scale: float = eqx.static_field()
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    scale: float = eqx.field(static=True)
 
     to_qkv: nn.Conv2d
     to_out: nn.Conv2d
@@ -93,7 +93,7 @@ class SelfAttention2d(eqx.Module):
 class UpsampledConv2d(eqx.Module):
     """Nearest-neighbor upsample followed by Conv2d."""
     conv: nn.Conv2d
-    scale: int = eqx.static_field()
+    scale: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -135,7 +135,7 @@ class Encoder2d(eqx.Module):
     proj: nn.Conv2d
     norm_out: tp.Optional[nn.GroupNorm]
 
-    use_norm: bool = eqx.static_field()
+    use_norm: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -147,6 +147,7 @@ class Encoder2d(eqx.Module):
         use_attention: bool = True,
         use_norm: bool = True,
         attention_heads: int = 8,
+        in_channels: int = 1,
         key=None,
     ):
         """
@@ -159,15 +160,16 @@ class Encoder2d(eqx.Module):
             use_attention: Whether to use self-attention at bottleneck
             use_norm: Whether to use GroupNorm in ResBlocks
             attention_heads: Number of attention heads
+            in_channels: Number of input channels
         """
         self.use_norm = use_norm
         num_stages = len(channel_mult)
         total_blocks = 1 + num_stages * (1 + num_res_blocks) + num_res_blocks + 2
         keys = iter(jax.random.split(key, total_blocks + 5))
 
-        # Initial conv: 1 -> base_channels
+        # Initial conv: in_channels -> base_channels
         ch_in = base_channels * channel_mult[0]
-        self.in_conv = nn.Conv2d(1, ch_in, kernel_size=3, stride=2, padding=1, key=next(keys))
+        self.in_conv = nn.Conv2d(in_channels, ch_in, kernel_size=3, stride=2, padding=1, key=next(keys))
 
         # Build stages
         stages = []
@@ -244,7 +246,7 @@ class Decoder2d(eqx.Module):
     norm_out: tp.Optional[nn.GroupNorm]
     out_conv: nn.Conv2d
 
-    use_norm: bool = eqx.static_field()
+    use_norm: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -256,6 +258,7 @@ class Decoder2d(eqx.Module):
         use_attention: bool = True,
         use_norm: bool = True,
         attention_heads: int = 8,
+        out_channels: int = 1,
         key=None,
     ):
         """
@@ -268,6 +271,7 @@ class Decoder2d(eqx.Module):
             use_attention: Whether to use self-attention at bottleneck
             use_norm: Whether to use GroupNorm in ResBlocks
             attention_heads: Number of attention heads
+            out_channels: Number of output channels
         """
         self.use_norm = use_norm
         num_stages = len(channel_mult)
@@ -323,7 +327,7 @@ class Decoder2d(eqx.Module):
             self.norm_out = nn.GroupNorm(groups=min(32, ch_final), channels=ch_final)
         else:
             self.norm_out = None
-        self.out_conv = nn.Conv2d(ch_final, 1, kernel_size=3, padding=1, key=next(keys))
+        self.out_conv = nn.Conv2d(ch_final, out_channels, kernel_size=3, padding=1, key=next(keys))
 
     def __call__(self, x):
         y = self.proj(x)
@@ -354,15 +358,15 @@ class Decoder2d(eqx.Module):
 
 class Quantizer2d(eqx.Module):
     """Vector quantization for 2D feature maps."""
-    K: int = eqx.static_field()  # vocab_size (number of codebook vectors)
-    D: int = eqx.static_field()  # codebook_dim (embedding dimension)
+    K: int = eqx.field(static=True)  # vocab_size (number of codebook vectors)
+    D: int = eqx.field(static=True)  # codebook_dim (embedding dimension)
     codebook: jax.Array
 
     codebook_avg: jax.Array
     cluster_size: jax.Array
 
-    decay: float = eqx.static_field()
-    eps: float = eqx.static_field()
+    decay: float = eqx.field(static=True)
+    eps: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -446,23 +450,25 @@ class MultiScaleQuantizer2d(eqx.Module):
 
     Progressively quantizes residuals at increasing resolutions (e.g., 1x1 → 2x2 → 4x4 → 8x8 → 16x16).
     Each scale has its own independent codebook, capturing scale-specific detail.
+    Scales are specified as (h, w) tuples to support non-square latents.
     """
-    scales: tuple = eqx.static_field()  # e.g., (1, 2, 4, 8, 16)
-    target_size: int = eqx.static_field()  # target resolution (16 for 16x16 latent)
-    K: int = eqx.static_field()  # vocab_size
-    D: int = eqx.static_field()  # codebook_dim
+    scales: tuple = eqx.field(static=True)  # e.g., ((1,1), (2,2), (4,4), (8,8), (16,16))
+    target_h: int = eqx.field(static=True)  # target height (max of scale heights)
+    target_w: int = eqx.field(static=True)  # target width (max of scale widths)
+    K: int = eqx.field(static=True)  # vocab_size
+    D: int = eqx.field(static=True)  # codebook_dim
 
     codebooks: tuple  # tuple of n_scales arrays, each [K, D]
     phi_convs: tuple  # per-scale 3x3 convolutions
     codebook_avgs: tuple  # tuple of n_scales arrays, each [K, D]
     cluster_sizes: tuple  # tuple of n_scales arrays, each [K]
 
-    decay: float = eqx.static_field()
-    eps: float = eqx.static_field()
+    decay: float = eqx.field(static=True)
+    eps: float = eqx.field(static=True)
 
     def __init__(
         self,
-        scales: tuple = (1, 2, 4, 8, 16),
+        scales: tuple = ((1, 1), (2, 2), (4, 4), (8, 8), (16, 16)),
         vocab_size: int = 4096,
         codebook_dim: int = 64,
         decay: float = 0.99,
@@ -470,7 +476,8 @@ class MultiScaleQuantizer2d(eqx.Module):
         key=None,
     ):
         self.scales = scales
-        self.target_size = max(scales)
+        self.target_h = max(s[0] for s in scales)
+        self.target_w = max(s[1] for s in scales)
         self.K = vocab_size
         self.D = codebook_dim
         self.decay = decay
@@ -506,7 +513,7 @@ class MultiScaleQuantizer2d(eqx.Module):
         """Multi-scale quantization with residual learning.
 
         Args:
-            x: Encoder output [D, H, W] where H=W=target_size
+            x: Encoder output [D, H, W] where H=target_h, W=target_w
 
         Returns:
             z_q: Quantized output [D, H, W]
@@ -515,7 +522,7 @@ class MultiScaleQuantizer2d(eqx.Module):
             commit_loss: Per-scale commitment loss (sum of MSE at each scale)
         """
         D, H, W = x.shape
-        assert H == W == self.target_size, f"Expected {self.target_size}x{self.target_size}, got {H}x{W}"
+        assert H == self.target_h and W == self.target_w, f"Expected {self.target_h}x{self.target_w}, got {H}x{W}"
 
         r = x  # residual = encoder output
         quantized_sum = jnp.zeros_like(x)
@@ -524,9 +531,9 @@ class MultiScaleQuantizer2d(eqx.Module):
         per_scale_indices = []
         commit_loss = 0.0
 
-        for k, scale in enumerate(self.scales):
+        for k, (sh, sw) in enumerate(self.scales):
             # Downsample residual to current scale
-            r_k = jax.image.resize(r, (D, scale, scale), method="bilinear")
+            r_k = jax.image.resize(r, (D, sh, sw), method="bilinear")
 
             # Per-scale convolution
             r_k = self.phi_convs[k](r_k)
@@ -540,7 +547,7 @@ class MultiScaleQuantizer2d(eqx.Module):
             )
 
             # Upsample quantized back to target size
-            z_q_k_up = jax.image.resize(z_q_k, (D, self.target_size, self.target_size), method="nearest")
+            z_q_k_up = jax.image.resize(z_q_k, (D, self.target_h, self.target_w), method="nearest")
 
             # Accumulate and compute residual for next scale
             quantized_sum = quantized_sum + z_q_k_up
@@ -643,7 +650,7 @@ class VARVQVAE2d(eqx.Module):
         hidden_dim: int = 512,
         codebook_dim: int = 64,
         vocab_size: int = 4096,
-        scales: tuple = (1, 2, 4, 8, 16),
+        scales: tuple = ((1, 1), (2, 2), (4, 4), (8, 8), (16, 16)),
         decay: float = 0.99,
         # Encoder/decoder capacity parameters
         base_channels: int = 128,
@@ -652,6 +659,7 @@ class VARVQVAE2d(eqx.Module):
         use_attention: bool = True,
         use_norm: bool = True,
         attention_heads: int = 8,
+        in_channels: int = 1,
         key=None,
     ):
         """
@@ -659,7 +667,7 @@ class VARVQVAE2d(eqx.Module):
             hidden_dim: Legacy param, unused with new architecture
             codebook_dim: Latent dimension per spatial position
             vocab_size: Number of codebook vectors
-            scales: Multi-scale quantization resolutions
+            scales: Multi-scale quantization resolutions as (h, w) tuples
             decay: EMA decay for codebook updates
             base_channels: Base channel count for encoder/decoder
             channel_mult: Channel multipliers per stage (e.g., (1,2,4,4) -> 128,256,512,512)
@@ -667,6 +675,7 @@ class VARVQVAE2d(eqx.Module):
             use_attention: Enable self-attention at bottleneck
             use_norm: Enable GroupNorm in ResBlocks
             attention_heads: Number of attention heads
+            in_channels: Number of input/output channels
         """
         key1, key2, key3 = jax.random.split(key, 3)
 
@@ -679,6 +688,7 @@ class VARVQVAE2d(eqx.Module):
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=attention_heads,
+            in_channels=in_channels,
             key=key1,
         )
         self.decoder = Decoder2d(
@@ -690,6 +700,7 @@ class VARVQVAE2d(eqx.Module):
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=attention_heads,
+            out_channels=in_channels,
             key=key2,
         )
         self.quantizer = MultiScaleQuantizer2d(
@@ -704,7 +715,7 @@ class VARVQVAE2d(eqx.Module):
         """Forward pass through VAR VQ-VAE.
 
         Args:
-            x: Input [1, H, W] (single channel vorticity field)
+            x: Input [C, H, W]
 
         Returns:
             z_e: Encoder output [D, H', W']
@@ -712,7 +723,7 @@ class VARVQVAE2d(eqx.Module):
             codebook_updates: Tuple for EMA updates
             indices_list: List of indices for each scale
             commit_loss: Per-scale commitment loss from quantizer
-            y: Reconstruction [1, H, W]
+            y: Reconstruction [C, H, W]
         """
         z_e = self.encoder(x)  # [codebook_dim, 16, 16]
         z_q, codebook_updates, indices_list, commit_loss = self.quantizer(z_e)
@@ -733,21 +744,22 @@ class VARVQVAE2d(eqx.Module):
         """Decode from multi-scale codebook indices.
 
         Args:
-            indices_list: List of indices for each scale, shapes [s, s] for s in scales
+            indices_list: List of indices for each scale, shapes [sh, sw] for (sh, sw) in scales
 
         Returns:
-            Reconstruction [1, H, W]
+            Reconstruction [C, H, W]
         """
         D = self.quantizer.D
-        target_size = self.quantizer.target_size
-        z_q = jnp.zeros((D, target_size, target_size))
+        target_h = self.quantizer.target_h
+        target_w = self.quantizer.target_w
+        z_q = jnp.zeros((D, target_h, target_w))
 
         for k, indices in enumerate(indices_list):
             H, W = indices.shape
             z_q_k = self.quantizer.codebooks[k][indices.flatten()]  # [H*W, D]
             z_q_k = jnp.reshape(z_q_k, (H, W, D))  # [H, W, D]
             z_q_k = jnp.transpose(z_q_k, (2, 0, 1))  # [D, H, W]
-            z_q_k_up = jax.image.resize(z_q_k, (D, target_size, target_size), method="nearest")
+            z_q_k_up = jax.image.resize(z_q_k, (D, target_h, target_w), method="nearest")
             z_q = z_q + z_q_k_up
 
         return self.decoder(z_q)
@@ -772,6 +784,7 @@ class VQVAE2d(eqx.Module):
         use_attention: bool = True,
         use_norm: bool = True,
         attention_heads: int = 8,
+        in_channels: int = 1,
         key=None,
     ):
         """
@@ -786,6 +799,7 @@ class VQVAE2d(eqx.Module):
             use_attention: Enable self-attention at bottleneck
             use_norm: Enable GroupNorm in ResBlocks
             attention_heads: Number of attention heads
+            in_channels: Number of input/output channels
         """
         key1, key2, key3 = jax.random.split(key, 3)
 
@@ -798,6 +812,7 @@ class VQVAE2d(eqx.Module):
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=attention_heads,
+            in_channels=in_channels,
             key=key1,
         )
         self.decoder = Decoder2d(
@@ -809,15 +824,16 @@ class VQVAE2d(eqx.Module):
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=attention_heads,
+            out_channels=in_channels,
             key=key2,
         )
         self.quantizer = Quantizer2d(vocab_size=vocab_size, codebook_dim=codebook_dim, decay=decay, key=key3)
 
     def __call__(self, x):
-        # x shape: [1, H, W] (single channel vorticity field)
+        # x shape: [C, H, W]
         z_e = self.encoder(x)  # [codebook_dim, H', W']
         z_q, codebook_updates, indices = self.quantizer(z_e)  # [codebook_dim, H', W'], [H', W']
-        y = self.decoder(z_q)  # [1, H, W]
+        y = self.decoder(z_q)  # [C, H, W]
         return z_e, z_q, codebook_updates, indices, y
 
     def encode(self, x):

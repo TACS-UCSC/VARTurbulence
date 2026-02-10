@@ -51,19 +51,20 @@ class PrefetchIterator:
     def __del__(self):
         self.stop_event.set()
 
-# Load all turbulence data into memory
+# Load all turbulence data into memory as a pre-stacked numpy array
 def load_turbulence_data_mat(data_dir, start_idx=10000, stop_idx=19999, normalize=False):
-    data = {}
+    samples = []
     print(f"Loading {stop_idx - start_idx + 1} files...")
     for idx in range(start_idx, stop_idx + 1):
         file_path = os.path.join(data_dir, f"{idx}.mat")
-        data[idx] = loadmat(file_path)['Omega']
+        samples.append(loadmat(file_path)['Omega'])
+
+    data = np.stack(samples).astype(np.float32)  # (N, H, W)
+    data = data[:, np.newaxis, :, :]              # (N, 1, H, W)
 
     if normalize:
-        all_data = np.stack(list(data.values()))
-        mean, std = np.mean(all_data), np.std(all_data)
-        for idx in data:
-            data[idx] = (data[idx] - mean) / std
+        mean, std = data.mean(), data.std()
+        data = (data - mean) / std
 
     return data
 

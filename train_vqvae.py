@@ -16,7 +16,7 @@ except ImportError:
 
 from models import VQVAE2d, VARVQVAE2d
 from trainer import make_step, make_step_var
-from dataloaders import load_turbulence_data_mat, create_turbulence_dataloader
+from dataloaders import load_turbulence_data_mat
 
 
 def parse_args():
@@ -41,7 +41,9 @@ def parse_args():
     parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
     # VAR mode arguments
     parser.add_argument("--var_mode", action="store_true", help="Enable VAR multi-scale quantization")
-    parser.add_argument("--scales", type=str, default="1,2,4,8,16", help="Comma-separated scales for VAR mode")
+    parser.add_argument("--scales", type=str, default="1x1,2x2,4x4,8x8,16x16",
+                        help="Comma-separated (h)x(w) scales for VAR mode (e.g. 1x1,2x2,4x4,8x8,16x16)")
+    parser.add_argument("--in_channels", type=int, default=1, help="Number of input/output channels")
     # Encoder/decoder capacity arguments
     parser.add_argument("--base_channels", type=int, default=128,
                         help="Base channel count (multiplied by channel_mult)")
@@ -118,10 +120,13 @@ def main():
         stop_idx=args.stop_idx,
         normalize=args.normalize
     )
-    print(f"Loaded {len(data)} samples")
+    n_samples = data.shape[0]
+    print(f"Loaded {n_samples} samples, shape {data.shape}")
 
-    # Parse scales for VAR mode
-    scales = tuple(int(s) for s in args.scales.split(","))
+    # Parse scales for VAR mode as (h, w) tuples
+    scales = tuple(
+        tuple(int(d) for d in s.split("x")) for s in args.scales.split(",")
+    )
 
     # Parse channel multipliers
     channel_mult = tuple(int(m) for m in args.channel_mult.split(","))
@@ -148,6 +153,7 @@ def main():
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=args.attention_heads,
+            in_channels=args.in_channels,
             key=model_key,
         )
         step_fn = make_step_var
@@ -166,18 +172,19 @@ def main():
             use_attention=use_attention,
             use_norm=use_norm,
             attention_heads=args.attention_heads,
+            in_channels=args.in_channels,
             key=model_key,
         )
         step_fn = make_step
 
-    # Test forward pass
-    test_input = jnp.zeros((1, 1, 256, 256))
+    # Test forward pass using actual data spatial dims
+    test_input = jnp.asarray(data[:1])  # (1, 1, H, W)
     if args.var_mode:
         z_e, z_q, _, indices_list, _, y = jax.vmap(model)(test_input)
         print(f"Input shape: {test_input.shape}")
         print(f"Latent shape (z_e): {z_e.shape}")
         print(f"Indices shapes: {[idx.shape for idx in indices_list]}")
-        total_tokens = sum(s * s for s in scales)
+        total_tokens = sum(sh * sw for sh, sw in scales)
         print(f"Total tokens per sample: {total_tokens}")
         print(f"Output shape: {y.shape}")
     else:
@@ -188,7 +195,7 @@ def main():
         print(f"Output shape: {y.shape}")
 
     # Calculate total training steps for LR schedule
-    steps_per_epoch = len(data) // args.batch_size
+    steps_per_epoch = n_samples // args.batch_size
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = min(1000, total_steps // 10)  # 10% of training or 1000 steps, whichever is smaller
 
@@ -223,6 +230,7 @@ def main():
             "seed": args.seed,
             "normalize": args.normalize,
             "var_mode": args.var_mode,
+            "in_channels": args.in_channels,
             # Capacity hyperparameters
             "base_channels": args.base_channels,
             "channel_mult": channel_mult,
@@ -233,7 +241,7 @@ def main():
         }
         if args.var_mode:
             config["scales"] = scales
-            config["total_tokens"] = sum(s * s for s in scales)
+            config["total_tokens"] = sum(sh * sw for sh, sw in scales)
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name,
@@ -249,17 +257,14 @@ def main():
         epoch_recon_losses = []
         epoch_commit_losses = []
 
-        # Create dataloader for this epoch
-        key, loader_key = jax.random.split(key)
-        dataloader = create_turbulence_dataloader(
-            data,
-            batch_size=args.batch_size,
-            dt=1,  # Use single frames, not pairs
-            shuffle=True,
-            seed=int(loader_key[0])
-        )
+        # Shuffle indices for this epoch (on CPU, no GPU memory)
+        key, perm_key = jax.random.split(key)
+        perm = np.array(jax.random.permutation(perm_key, n_samples))
+        num_batches = n_samples // args.batch_size
 
-        for batch_idx, (inputs, _) in enumerate(dataloader):
+        for batch_idx in range(num_batches):
+            start = batch_idx * args.batch_size
+            inputs = jnp.asarray(data[perm[start : start + args.batch_size]])
             key, step_key = jax.random.split(key)
 
             model, opt_state, total_loss, recon_loss, commit_loss, indices_out, outputs = step_fn(
@@ -290,14 +295,14 @@ def main():
                     "step": global_step,
                 }
                 if args.var_mode:
-                    for si, s in enumerate(scales):
-                        log_dict[f"codebook/unique_codes_scale_{s}x{s}"] = per_scale_unique[si]
-                        log_dict[f"codebook/utilization_scale_{s}x{s}"] = per_scale_unique[si] / args.vocab_size
+                    for si, (sh, sw) in enumerate(scales):
+                        log_dict[f"codebook/unique_codes_scale_{sh}x{sw}"] = per_scale_unique[si]
+                        log_dict[f"codebook/utilization_scale_{sh}x{sw}"] = per_scale_unique[si] / args.vocab_size
                 wandb.log(log_dict)
 
             if batch_idx % 50 == 0:
                 if args.var_mode:
-                    scale_str = " ".join(f"{s}:{n}" for s, n in zip(scales, per_scale_unique))
+                    scale_str = " ".join(f"{sh}x{sw}:{n}" for (sh, sw), n in zip(scales, per_scale_unique))
                     print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes} [{scale_str}]")
                 else:
                     print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes}")

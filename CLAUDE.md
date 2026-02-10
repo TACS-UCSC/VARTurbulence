@@ -4,11 +4,12 @@ JAX/Equinox implementation of a Vector Quantized VAE for compressing 2D turbulen
 
 ## Architecture
 
-- **Input**: 256×256 single-channel vorticity snapshots from `.mat` files
-- **Encoder**: 16× downsampling (256→16) via strided convolutions + residual blocks
-- **Quantizer**: Vector quantization with EMA codebook updates, straight-through gradients
-- **Decoder**: 16× upsampling via nearest-neighbor interpolation + convolutions
-- **Output**: 16×16 grid of codebook indices (discrete latent representation)
+- **Input**: C×H×W fields (multi-channel, non-square supported) from `.mat` files
+- **Encoder**: 16× downsampling via strided convolutions + residual blocks, configurable `in_channels`
+- **Quantizer**: Vector quantization with EMA codebook updates, straight-through gradients. Per-scale codebooks are channel-agnostic (encoder projects all channels into `codebook_dim`).
+- **Decoder**: 16× upsampling via nearest-neighbor interpolation + convolutions, configurable `out_channels`
+- **Output**: Multi-scale grid of codebook indices (discrete latent representation)
+- **Scales**: Specified as `(h, w)` tuples, e.g. `((1,1), (2,2), (4,4), (8,8), (16,16))` for square, or `((1,1), (2,1), (4,2), (8,4), (16,8))` for non-square latents
 
 ## Files
 
