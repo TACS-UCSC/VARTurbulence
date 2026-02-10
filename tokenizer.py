@@ -48,7 +48,8 @@ def load_vqvae_checkpoint(checkpoint_path: str, config: dict, key) -> eqx.Module
             hidden_dim=config.get("hidden_dim", 512),
             codebook_dim=config.get("codebook_dim", 64),
             vocab_size=config.get("vocab_size", 4096),
-            scales=config.get("scales", (1, 2, 4, 8, 16)),
+            scales=config.get("scales", ((1, 1), (2, 2), (4, 4), (8, 8), (16, 16))),
+            in_channels=config.get("in_channels", 1),
             decay=config.get("decay", 0.99),
             base_channels=config.get("base_channels", 128),
             channel_mult=config.get("channel_mult", (1, 2, 4, 4)),
@@ -70,6 +71,7 @@ def load_vqvae_checkpoint(checkpoint_path: str, config: dict, key) -> eqx.Module
             use_attention=config.get("use_attention", True),
             use_norm=config.get("use_norm", True),
             attention_heads=config.get("attention_heads", 8),
+            in_channels=config.get("in_channels", 1),
             key=key,
         )
 
@@ -106,7 +108,7 @@ def flatten_multiscale_indices(indices_list):
     """Flatten multi-scale indices to a single 1D array.
 
     Args:
-        indices_list: List of arrays with shapes [s, s] for each scale s
+        indices_list: List of arrays with shapes [sh, sw] for each scale (sh, sw)
 
     Returns:
         Flattened 1D array of all indices concatenated
@@ -119,16 +121,16 @@ def unflatten_to_scales(flat_indices, scales):
 
     Args:
         flat_indices: 1D array of concatenated indices
-        scales: Tuple of scale sizes (e.g., (1, 2, 4, 8, 16))
+        scales: Tuple of (h, w) tuples (e.g., ((1,1), (2,2), (4,4), (8,8), (16,16)))
 
     Returns:
-        List of arrays with shapes [s, s] for each scale s
+        List of arrays with shapes [sh, sw] for each scale (sh, sw)
     """
     indices_list = []
     offset = 0
-    for s in scales:
-        size = s * s
-        idx = flat_indices[offset : offset + size].reshape(s, s)
+    for (sh, sw) in scales:
+        size = sh * sw
+        idx = flat_indices[offset : offset + size].reshape(sh, sw)
         indices_list.append(idx)
         offset += size
     return indices_list
@@ -167,6 +169,7 @@ class VQVAETokenizer:
         model: eqx.Module,
         old_to_new: Optional[jnp.ndarray] = None,
         new_to_old: Optional[jnp.ndarray] = None,
+        first_trainable_scale: Optional[int] = None,
     ):
         self.model = model
         self.old_to_new = old_to_new
@@ -178,6 +181,10 @@ class VQVAETokenizer:
             self.scales = model.quantizer.scales
         else:
             self.scales = None
+
+        # Deterministic vs trainable scale tracking (VAR mode only)
+        self.first_trainable_scale = first_trainable_scale
+        self.deterministic_scales = None
 
         # Unified per-scale codebook mapping (VAR mode only, set by fit() or set_mapping())
         self.scale_old_to_unified = None
@@ -200,7 +207,10 @@ class VQVAETokenizer:
             VQVAETokenizer instance (unfitted)
         """
         model = load_vqvae_checkpoint(checkpoint_path, config, key)
-        return cls(model)
+        return cls(
+            model,
+            first_trainable_scale=config.get("first_trainable_scale"),
+        )
 
     @property
     def is_fitted(self) -> bool:
@@ -288,7 +298,7 @@ class VQVAETokenizer:
     def tokens_per_sample(self) -> int:
         """Total number of tokens per sample."""
         if self.var_mode:
-            return sum(s * s for s in self.scales)
+            return sum(sh * sw for sh, sw in self.scales)
         else:
             # Standard VQ-VAE: 16x16 latent grid
             return 16 * 16
@@ -299,14 +309,14 @@ class VQVAETokenizer:
         all_indices = indices.reshape(-1)
         return jnp.unique(all_indices)
 
-    def fit(self, data: dict, batch_size: int = 32):
+    def fit(self, data: np.ndarray, batch_size: int = 32):
         """First pass: collect unique indices and build mapping.
 
         For VAR mode, builds a unified per-scale codebook where each scale
         gets its own contiguous index range in the unified vocabulary.
 
         Args:
-            data: Dictionary mapping indices to vorticity arrays (from load_turbulence_data_mat)
+            data: numpy array of shape (N, 1, H, W) from load_turbulence_data_mat
             batch_size: Batch size for processing
 
         Returns:
@@ -314,10 +324,7 @@ class VQVAETokenizer:
         """
         print("Fitting tokenizer: collecting unique codebook indices...")
 
-        # Convert data dict to array
-        indices = sorted(data.keys())
-        all_data = np.stack([data[idx] for idx in indices])  # [N, H, W]
-        all_data = all_data[:, None, :, :]  # [N, 1, H, W]
+        all_data = data  # already (N, 1, H, W)
         n_samples = len(all_data)
 
         n_batches = (n_samples + batch_size - 1) // batch_size
@@ -372,7 +379,8 @@ class VQVAETokenizer:
                 # Unified codebook part from this scale's codebook
                 unified_codebook_parts.append(self.codebooks[k][unique_sorted])
 
-                print(f"  Scale {self.scales[k]:2d}: {n_unique:4d} unique codes "
+                sh, sw = self.scales[k]
+                print(f"  Scale {sh}x{sw}: {n_unique:4d} unique codes "
                       f"(unified [{unified_offset}, {unified_offset + n_unique}))")
 
                 unified_offset += n_unique
@@ -382,6 +390,25 @@ class VQVAETokenizer:
             self.unified_to_scale = jnp.concatenate(unified_to_scale_parts)
             self.unified_to_original = jnp.concatenate(unified_to_original_parts)
             self.unified_codebook = jnp.concatenate(unified_codebook_parts, axis=0)
+
+            # Auto-detect deterministic scales (scales where only 1 unique code is used)
+            if self.first_trainable_scale is None:
+                last_deterministic = -1
+                for k in range(n_scales):
+                    if scale_vocab_sizes[k] == 1:
+                        last_deterministic = k
+                    else:
+                        break
+                self.first_trainable_scale = last_deterministic + 1
+            self.deterministic_scales = list(range(self.first_trainable_scale))
+
+            if self.first_trainable_scale > 0:
+                det_names = [f"{sh}x{sw}" for sh, sw in self.scales[:self.first_trainable_scale]]
+                print(f"Deterministic scales: {', '.join(det_names)} (indices 0-{self.first_trainable_scale - 1})")
+                sh, sw = self.scales[self.first_trainable_scale]
+                print(f"First trainable scale: {sh}x{sw} (index {self.first_trainable_scale})")
+            else:
+                print("No deterministic scales detected")
 
             print(f"Fit complete: {self.effective_vocab_size} unified vocab "
                   f"(from {self.vocab_size} per-scale codebook, {n_scales} scales)")
@@ -553,7 +580,7 @@ class VQVAETokenizer:
 
 def create_tokenized_dataloader(
     tokenizer: VQVAETokenizer,
-    data: dict,
+    data: np.ndarray,
     batch_size: int,
     shuffle: bool = True,
     seed: int = 0,
@@ -564,9 +591,7 @@ def create_tokenized_dataloader(
         indices: [B, total_tokens] remapped discrete indices
         vectors: [B, total_tokens, codebook_dim] corresponding codebook vectors
     """
-    # Convert data dict to array
-    data_indices = sorted(data.keys())
-    all_data = np.stack([data[idx] for idx in data_indices])[:, None, :, :]
+    all_data = data  # already (N, 1, H, W)
     n_samples = len(all_data)
 
     # Shuffle if requested
@@ -589,7 +614,7 @@ def create_tokenized_dataloader(
 def save_tokenized_data(
     path: str,
     tokenizer: VQVAETokenizer,
-    data: dict,
+    data: np.ndarray,
     config: dict,
     batch_size: int = 32,
 ):
@@ -598,7 +623,7 @@ def save_tokenized_data(
     Args:
         path: Output path for .npz file
         tokenizer: Fitted VQVAETokenizer
-        data: Data dictionary from load_turbulence_data_mat
+        data: numpy array of shape (N, 1, H, W) from load_turbulence_data_mat
         config: Model configuration dict
         batch_size: Batch size for processing
     """
@@ -607,17 +632,15 @@ def save_tokenized_data(
 
     print(f"Tokenizing and saving to {path}...")
 
-    # Convert data dict to array
-    data_indices = sorted(data.keys())
-    all_data = np.stack([data[idx] for idx in data_indices])[:, None, :, :]
+    all_data = data  # already (N, 1, H, W)
     n_samples = len(all_data)
 
     # Collect all tokenized data
     all_indices = []
     all_vectors = []
 
-    # Per-scale indices for VAR mode
-    per_scale_indices = {s: [] for s in (tokenizer.scales or [])}
+    # Per-scale indices for VAR mode (keyed by scale index)
+    per_scale_indices = {k: [] for k in range(len(tokenizer.scales or []))}
 
     n_batches = (n_samples + batch_size - 1) // batch_size
 
@@ -633,8 +656,8 @@ def save_tokenized_data(
         # Also collect per-scale indices for VAR mode
         if tokenizer.var_mode:
             remapped, _ = tokenizer.encode_batch(batch)
-            for scale_idx, s in enumerate(tokenizer.scales):
-                per_scale_indices[s].append(np.array(remapped[scale_idx]))
+            for scale_idx in range(len(tokenizer.scales)):
+                per_scale_indices[scale_idx].append(np.array(remapped[scale_idx]))
 
         if (i + 1) % 50 == 0 or i == n_batches - 1:
             print(f"  Processed {end}/{n_samples} samples")
@@ -664,9 +687,11 @@ def save_tokenized_data(
         save_dict["scale_vocab_sizes"] = np.array(tokenizer.scale_vocab_sizes)
         save_dict["unified_to_scale"] = np.array(tokenizer.unified_to_scale)
         save_dict["unified_to_original"] = np.array(tokenizer.unified_to_original)
+        if tokenizer.first_trainable_scale is not None:
+            save_dict["first_trainable_scale"] = np.array(tokenizer.first_trainable_scale)
 
-        for k, s in enumerate(tokenizer.scales):
-            save_dict[f"indices_scale_{s}"] = np.concatenate(per_scale_indices[s], axis=0)
+        for k, (sh, sw) in enumerate(tokenizer.scales):
+            save_dict[f"indices_scale_{sh}x{sw}"] = np.concatenate(per_scale_indices[k], axis=0)
             save_dict[f"original_codebook_scale_{k}"] = np.array(tokenizer.codebooks[k])
             save_dict[f"scale_old_to_unified_{k}"] = np.array(tokenizer.scale_old_to_unified[k])
     else:
@@ -704,14 +729,15 @@ def load_tokenized_data(path: str) -> dict:
             - new_to_old: [effective_vocab] mapping
 
             VAR mode only:
-            - scales: tuple
+            - scales: tuple of (h, w) tuples
             - scale_offsets: [n_scales] start of each scale's unified range
             - scale_vocab_sizes: [n_scales] unique codes per scale
             - unified_to_scale: [unified_vocab] scale index per entry
             - unified_to_original: [unified_vocab] original codebook index per entry
             - scale_old_to_unified: list of [K] per-scale mapping arrays
-            - indices_scale_{s}: [N, s, s] per-scale indices
+            - indices_scale_{sh}x{sw}: [N, sh, sw] per-scale indices
             - original_codebooks: list of [vocab_size, D] per-scale original codebooks
+            - first_trainable_scale: int (if available)
     """
     data = dict(np.load(path, allow_pickle=True))
 
@@ -729,7 +755,7 @@ def load_tokenized_data(path: str) -> dict:
 
     if result["var_mode"]:
         # Unified per-scale codebook fields
-        result["scales"] = tuple(data["scales"].tolist())
+        result["scales"] = tuple(tuple(s) for s in data["scales"].tolist())
         n_scales = len(result["scales"])
 
         result["scale_offsets"] = data["scale_offsets"]
@@ -737,10 +763,13 @@ def load_tokenized_data(path: str) -> dict:
         result["unified_to_scale"] = data["unified_to_scale"]
         result["unified_to_original"] = data["unified_to_original"]
 
+        if "first_trainable_scale" in data:
+            result["first_trainable_scale"] = int(data["first_trainable_scale"])
+
         scale_old_to_unified = []
         original_codebooks = []
-        for k, s in enumerate(result["scales"]):
-            key = f"indices_scale_{s}"
+        for k, (sh, sw) in enumerate(result["scales"]):
+            key = f"indices_scale_{sh}x{sw}"
             if key in data:
                 result[key] = data[key]
             mapping_key = f"scale_old_to_unified_{k}"
@@ -761,12 +790,12 @@ def load_tokenized_data(path: str) -> dict:
     return result
 
 
-def print_tokenizer_info(tokenizer: VQVAETokenizer, data: dict):
+def print_tokenizer_info(tokenizer: VQVAETokenizer, data: np.ndarray):
     """Print statistics about the tokenizer and data.
 
     Args:
         tokenizer: Fitted VQVAETokenizer
-        data: Data dictionary
+        data: numpy array of shape (N, 1, H, W)
     """
     print("\n" + "=" * 60)
     print("TOKENIZER INFO")
@@ -778,18 +807,25 @@ def print_tokenizer_info(tokenizer: VQVAETokenizer, data: dict):
     print(f"Codebook dimension: {tokenizer.codebook_dim}")
 
     if tokenizer.var_mode:
-        print(f"\nScales: {tokenizer.scales}")
-        print(f"Tokens per scale: {[s*s for s in tokenizer.scales]}")
+        scale_strs = [f"{sh}x{sw}" for sh, sw in tokenizer.scales]
+        print(f"\nScales: {', '.join(scale_strs)}")
+        print(f"Tokens per scale: {[sh*sw for sh, sw in tokenizer.scales]}")
         print(f"Total tokens per sample: {tokenizer.tokens_per_sample}")
+
+        if tokenizer.first_trainable_scale is not None:
+            print(f"First trainable scale: index {tokenizer.first_trainable_scale}")
+            if tokenizer.deterministic_scales:
+                det_names = [f"{sh}x{sw}" for sh, sw in tokenizer.scales[:tokenizer.first_trainable_scale]]
+                print(f"Deterministic scales: {', '.join(det_names)}")
 
         # Unified codebook breakdown
         print(f"\nUnified codebook breakdown:")
-        for k, s in enumerate(tokenizer.scales):
+        for k, (sh, sw) in enumerate(tokenizer.scales):
             offset = int(tokenizer.scale_offsets[k])
             n = int(tokenizer.scale_vocab_sizes[k])
-            print(f"  Scale {s:2d}: {n:4d} unique codes "
+            print(f"  Scale {sh}x{sw}: {n:4d} unique codes "
                   f"(unified [{offset}, {offset + n}), "
-                  f"{s*s} positions/frame)")
+                  f"{sh*sw} positions/frame)")
     else:
         print(f"Codebook utilization: {100 * tokenizer.effective_vocab_size / tokenizer.vocab_size:.1f}%")
         print(f"\nTokens per sample: {tokenizer.tokens_per_sample} (16x16 grid)")
@@ -799,8 +835,8 @@ def print_tokenizer_info(tokenizer: VQVAETokenizer, data: dict):
 
     # Codebook usage histogram
     if tokenizer.var_mode:
-        for k, s in enumerate(tokenizer.scales):
-            print(f"\nCodebook usage distribution (scale {s}x{s}):")
+        for k, (sh, sw) in enumerate(tokenizer.scales):
+            print(f"\nCodebook usage distribution (scale {sh}x{sw}):")
             usage = np.array(tokenizer.model.quantizer.cluster_sizes[k])
             total_usage = usage.sum()
             if total_usage > 0:
@@ -859,7 +895,12 @@ def parse_args():
     common.add_argument("--no_norm", action="store_true")
     common.add_argument("--attention_heads", type=int, default=8)
     common.add_argument(
-        "--scales", type=str, default="1,2,3,4,5,6,8,10,13,16", help="Comma-separated"
+        "--scales", type=str, default="1x1,2x2,3x3,4x4,5x5,6x6,8x8,10x10,13x13,16x16",
+        help="Comma-separated HxW scales (e.g. 1x1,2x2,4x4,8x8,16x16)",
+    )
+    common.add_argument(
+        "--first_trainable_scale", type=int, default=None,
+        help="Index of first trainable scale (auto-detected if not set)",
     )
 
     # Save command
@@ -881,9 +922,11 @@ def parse_args():
 def build_config_from_args(args) -> dict:
     """Build config dict from parsed arguments."""
     channel_mult = tuple(int(m) for m in args.channel_mult.split(","))
-    scales = tuple(int(s) for s in args.scales.split(","))
+    scales = tuple(
+        tuple(int(d) for d in s.split("x")) for s in args.scales.split(",")
+    )
 
-    return {
+    config = {
         "var_mode": args.var_mode,
         "hidden_dim": args.hidden_dim,
         "codebook_dim": args.codebook_dim,
@@ -897,6 +940,11 @@ def build_config_from_args(args) -> dict:
         "attention_heads": args.attention_heads,
         "scales": scales,
     }
+
+    if args.first_trainable_scale is not None:
+        config["first_trainable_scale"] = args.first_trainable_scale
+
+    return config
 
 
 def main():
@@ -931,8 +979,7 @@ def main():
 
         # Verify round-trip
         print("Verifying round-trip encoding/decoding...")
-        sample_key = sorted(data.keys())[0]
-        sample = jnp.array(data[sample_key])[None, :, :]  # [1, H, W]
+        sample = jnp.array(data[0])  # [1, H, W]
 
         remapped, z_q = tokenizer.encode(sample)
         recon = tokenizer.decode_indices(remapped)
