@@ -1,0 +1,1 @@
+python moist_QG_channel_3d_derecho1.py -s  -l cold -n none -dd /glade/derecho/scratch/llupinji/data/qgm_sim -nf 0.2 -tt 20000 --name test2 --dt .025

@@ -133,283 +133,283 @@ def save_checkpoint(model, opt_state, epoch, checkpoint_dir, var_mode=False):
     eqx.tree_serialise_leaves(checkpoint_path, model)
     print(f"Saved checkpoint to {checkpoint_path}")
 
-# def main():
-args = parse_args()
+def main():
+    args = parse_args()
 
-# Set random seed
-key = jax.random.PRNGKey(args.seed)
+    # Set random seed
+    key = jax.random.PRNGKey(args.seed)
 
-# Load data
-if args.data_type == "rb_convection":
+    # Load data
+    if args.data_type == "rb_convection":
+        if args.data_dir is None:
+            data_dir = "/glade/derecho/scratch/llupinji/data/the_well_datasets/datasets/rayleigh_benard/data/train"
+        else:
+            data_dir = args.data_dir
+        fields = ["buoyancy", "pressure", "velocity_x", "velocity_y"]
+    else:
+        raise ValueError(f"Invalid data type: {args.data_type}")
+
+    print("Loading turbulence data...")
     if args.data_dir is None:
-        data_dir = "/glade/derecho/scratch/llupinji/data/the_well_datasets/datasets/rayleigh_benard/data/train"
+        data_locs = None
     else:
-        data_dir = args.data_dir
-    fields = ["buoyancy", "pressure", "velocity_x", "velocity_y"]
-else:
-    raise ValueError(f"Invalid data type: {args.data_type}")
+        data_locs = os.listdir(args.data_dir)
+        data_locs = [os.path.join(args.data_dir, loc) for loc in data_locs]
 
-print("Loading turbulence data...")
-if args.data_dir is None:
-    data_locs = None
-else:
-    data_locs = os.listdir(args.data_dir)
-    data_locs = [os.path.join(args.data_dir, loc) for loc in data_locs]
+    # Calculate total channels
+    total_channels = 0
+    for f in fields:
+        if f == "velocity":
+            total_channels += 2
+        else:
+            total_channels += 1
+    print(f"Total channels: {total_channels}")
 
-# Calculate total channels
-total_channels = 0
-for f in fields:
-    if f == "velocity":
-        total_channels += 2
-    else:
-        total_channels += 1
-print(f"Total channels: {total_channels}")
-
-# Create PyTorch DataLoader
-# data_loader = well_dataset_loader(
-data_loader = well_dataset_loader(
-    data_locs,
-    dataset_name=args.data_type,
-    start_idx=args.start_idx,
-    stop_idx=args.stop_idx,
-    normalize=args.normalize,
-    fields=fields,
-    dt=None,  # No temporal sequences, just individual samples
-    batch_size=args.batch_size,
-    shuffle=True,
-    seed=args.seed
-)
-
-print(f"Loaded {len(data_loader)} samples")
-
-# Create PyTorch DataLoader
-# data_loader = DataLoader(
-#     rb_dataset,
-#     batch_size=args.batch_size,
-#     shuffle=True,
-#     num_workers=0,  # Keep 0 for HDF5 data to avoid multiprocessing issues
-#     drop_last=True  # Drop last incomplete batch
-# )
-
-# Parse scales for VAR mode
-scales = tuple(int(s) for s in args.scales.split(","))
-
-# Parse channel multipliers
-channel_mult = tuple(int(m) for m in args.channel_mult.split(","))
-
-# Handle attention/norm flags
-use_attention = args.use_attention and not args.no_attention
-use_norm = args.use_norm and not args.no_norm
-
-# Initialize model
-key, model_key = jax.random.split(key)
-if args.var_mode:
-    print(f"Using VAR multi-scale VQ-VAE with scales: {scales}")
-    print(f"  base_channels={args.base_channels}, channel_mult={channel_mult}")
-    print(f"  num_res_blocks={args.num_res_blocks}, attention={use_attention}, norm={use_norm}")
-    model = VARVQVAE2d(
-        channels=total_channels,
-        hidden_dim=args.hidden_dim,
-        codebook_dim=args.codebook_dim,
-        vocab_size=args.vocab_size,
-        scales=scales,
-        decay=args.decay,
-        base_channels=args.base_channels,
-        channel_mult=channel_mult,
-        num_res_blocks=args.num_res_blocks,
-        use_attention=use_attention,
-        use_norm=use_norm,
-        attention_heads=args.attention_heads,
-        key=model_key,
+    # Create PyTorch DataLoader
+    # data_loader = well_dataset_loader(
+    data_loader = well_dataset_loader(
+        data_locs,
+        dataset_name=args.data_type,
+        start_idx=args.start_idx,
+        stop_idx=args.stop_idx,
+        normalize=args.normalize,
+        fields=fields,
+        dt=None,  # No temporal sequences, just individual samples
+        batch_size=args.batch_size,
+        shuffle=True,
+        seed=args.seed
     )
-    step_fn = make_step_var
-else:
-    print("Using standard VQ-VAE")
-    print(f"  base_channels={args.base_channels}, channel_mult={channel_mult}")
-    print(f"  num_res_blocks={args.num_res_blocks}, attention={use_attention}, norm={use_norm}")
-    model = VQVAE2d(
-        channels=total_channels,
-        hidden_dim=args.hidden_dim,
-        codebook_dim=args.codebook_dim,
-        vocab_size=args.vocab_size,
-        decay=args.decay,
-        base_channels=args.base_channels,
-        channel_mult=channel_mult,
-        num_res_blocks=args.num_res_blocks,
-        use_attention=use_attention,
-        use_norm=use_norm,
-        attention_heads=args.attention_heads,
-        key=model_key,
-    )
-    step_fn = make_step
 
-# Test forward pass
-test_input = jnp.zeros((1, total_channels, 256, 256))
-if args.var_mode:
-    z_e, z_q, _, indices_list, _, y = jax.vmap(model)(test_input)
-    print(f"Input shape: {test_input.shape}")
-    print(f"Latent shape (z_e): {z_e.shape}")
-    print(f"Indices shapes: {[idx.shape for idx in indices_list]}")
-    total_tokens = sum(s * s for s in scales)
-    print(f"Total tokens per sample: {total_tokens}")
-    print(f"Output shape: {y.shape}")
-else:
-    z_e, z_q, _, indices, y = jax.vmap(model)(test_input)
-    print(f"Input shape: {test_input.shape}")
-    print(f"Latent shape (z_e): {z_e.shape}")
-    print(f"Indices shape: {indices.shape}")
-    print(f"Output shape: {y.shape}")
+    print(f"Loaded {len(data_loader)} samples")
 
-# Calculate total training steps for LR schedule
-steps_per_epoch = len(data_loader)  # DataLoader already accounts for batching
-total_steps = steps_per_epoch * args.epochs
-warmup_steps = min(1000, total_steps // 10)  # 10% of training or 1000 steps, whichever is smaller
+    # Create PyTorch DataLoader
+    # data_loader = DataLoader(
+    #     rb_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=0,  # Keep 0 for HDF5 data to avoid multiprocessing issues
+    #     drop_last=True  # Drop last incomplete batch
+    # )
 
-print(f"Steps per epoch: {steps_per_epoch}")
-print(f"LR schedule: {warmup_steps} warmup steps, {total_steps} total steps")
+    # Parse scales for VAR mode
+    scales = tuple(int(s) for s in args.scales.split(","))
 
-# Initialize optimizer with warmup + cosine decay
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,
-    peak_value=args.lr,
-    warmup_steps=warmup_steps,
-    decay_steps=total_steps,
-    end_value=args.lr * 0.01,
-)
+    # Parse channel multipliers
+    channel_mult = tuple(int(m) for m in args.channel_mult.split(","))
 
-optimizer = optax.chain(
-    optax.clip_by_global_norm(0.5),
-    optax.adamw(schedule, weight_decay=1e-4),
-)
-opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    # Handle attention/norm flags
+    use_attention = args.use_attention and not args.no_attention
+    use_norm = args.use_norm and not args.no_norm
 
-# Initialize wandb
-if WANDB_AVAILABLE:
-    config = {
-        "hidden_dim": args.hidden_dim,
-        "codebook_dim": args.codebook_dim,
-        "vocab_size": args.vocab_size,
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "commitment_weight": args.commitment_weight,
-        "decay": args.decay,
-        "epochs": args.epochs,
-        "seed": args.seed,
-        "normalize": args.normalize,
-        "var_mode": args.var_mode,
-        # Capacity hyperparameters
-        "base_channels": args.base_channels,
-        "channel_mult": channel_mult,
-        "num_res_blocks": args.num_res_blocks,
-        "use_attention": use_attention,
-        "use_norm": use_norm,
-        "attention_heads": args.attention_heads,
-    }
+    # Initialize model
+    key, model_key = jax.random.split(key)
     if args.var_mode:
-        config["scales"] = scales
-        config["total_tokens"] = sum(s * s for s in scales)
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_name,
-        config=config
+        print(f"Using VAR multi-scale VQ-VAE with scales: {scales}")
+        print(f"  base_channels={args.base_channels}, channel_mult={channel_mult}")
+        print(f"  num_res_blocks={args.num_res_blocks}, attention={use_attention}, norm={use_norm}")
+        model = VARVQVAE2d(
+            channels=total_channels,
+            hidden_dim=args.hidden_dim,
+            codebook_dim=args.codebook_dim,
+            vocab_size=args.vocab_size,
+            scales=scales,
+            decay=args.decay,
+            base_channels=args.base_channels,
+            channel_mult=channel_mult,
+            num_res_blocks=args.num_res_blocks,
+            use_attention=use_attention,
+            use_norm=use_norm,
+            attention_heads=args.attention_heads,
+            key=model_key,
+        )
+        step_fn = make_step_var
+    else:
+        print("Using standard VQ-VAE")
+        print(f"  base_channels={args.base_channels}, channel_mult={channel_mult}")
+        print(f"  num_res_blocks={args.num_res_blocks}, attention={use_attention}, norm={use_norm}")
+        model = VQVAE2d(
+            channels=total_channels,
+            hidden_dim=args.hidden_dim,
+            codebook_dim=args.codebook_dim,
+            vocab_size=args.vocab_size,
+            decay=args.decay,
+            base_channels=args.base_channels,
+            channel_mult=channel_mult,
+            num_res_blocks=args.num_res_blocks,
+            use_attention=use_attention,
+            use_norm=use_norm,
+            attention_heads=args.attention_heads,
+            key=model_key,
+        )
+        step_fn = make_step
+
+    # Test forward pass
+    test_input = jnp.zeros((1, total_channels, 256, 256))
+    if args.var_mode:
+        z_e, z_q, _, indices_list, _, y = jax.vmap(model)(test_input)
+        print(f"Input shape: {test_input.shape}")
+        print(f"Latent shape (z_e): {z_e.shape}")
+        print(f"Indices shapes: {[idx.shape for idx in indices_list]}")
+        total_tokens = sum(s * s for s in scales)
+        print(f"Total tokens per sample: {total_tokens}")
+        print(f"Output shape: {y.shape}")
+    else:
+        z_e, z_q, _, indices, y = jax.vmap(model)(test_input)
+        print(f"Input shape: {test_input.shape}")
+        print(f"Latent shape (z_e): {z_e.shape}")
+        print(f"Indices shape: {indices.shape}")
+        print(f"Output shape: {y.shape}")
+
+    # Calculate total training steps for LR schedule
+    steps_per_epoch = len(data_loader)  # DataLoader already accounts for batching
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = min(1000, total_steps // 10)  # 10% of training or 1000 steps, whichever is smaller
+
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"LR schedule: {warmup_steps} warmup steps, {total_steps} total steps")
+
+    # Initialize optimizer with warmup + cosine decay
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=args.lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=args.lr * 0.01,
     )
 
-# Training loop
-global_step = 0
-for epoch in range(args.epochs):
-    print(f"\nEpoch {epoch + 1}/{args.epochs}")
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adamw(schedule, weight_decay=1e-4),
+    )
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    epoch_losses = []
-    epoch_recon_losses = []
-    epoch_commit_losses = []
-
-    # Create dataloader for this epoch
-    key, loader_key = jax.random.split(key)
-
-    for batch_idx, batch_data in enumerate(data_loader):
-        key, step_key = jax.random.split(key)
-        
-        # Convert PyTorch tensor to numpy
-        # batch_data is (B, C, H, W)
-        inputs = np.array(batch_data.numpy())
-        inputs = jnp.array(inputs)
-
-        model, opt_state, total_loss, recon_loss, commit_loss, indices_out, outputs = step_fn(
-            model, optimizer, opt_state, inputs, step_key, args.commitment_weight
+    # Initialize wandb
+    if WANDB_AVAILABLE:
+        config = {
+            "hidden_dim": args.hidden_dim,
+            "codebook_dim": args.codebook_dim,
+            "vocab_size": args.vocab_size,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "commitment_weight": args.commitment_weight,
+            "decay": args.decay,
+            "epochs": args.epochs,
+            "seed": args.seed,
+            "normalize": args.normalize,
+            "var_mode": args.var_mode,
+            # Capacity hyperparameters
+            "base_channels": args.base_channels,
+            "channel_mult": channel_mult,
+            "num_res_blocks": args.num_res_blocks,
+            "use_attention": use_attention,
+            "use_norm": use_norm,
+            "attention_heads": args.attention_heads,
+        }
+        if args.var_mode:
+            config["scales"] = scales
+            config["total_tokens"] = sum(s * s for s in scales)
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config=config
         )
 
-        epoch_losses.append(float(total_loss))
-        epoch_recon_losses.append(float(recon_loss))
-        epoch_commit_losses.append(float(commit_loss))
+    # Training loop
+    global_step = 0
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        # Count unique codes used
-        if args.var_mode:
-            # indices_out is a list of arrays for each scale
-            all_indices = np.concatenate([np.array(idx).flatten() for idx in indices_out])
-            unique_codes = len(np.unique(all_indices))
-        else:
-            unique_codes = len(np.unique(np.array(indices_out)))
+        epoch_losses = []
+        epoch_recon_losses = []
+        epoch_commit_losses = []
 
-        # Log to wandb
+        # Create dataloader for this epoch
+        key, loader_key = jax.random.split(key)
+
+        for batch_idx, batch_data in enumerate(data_loader):
+            key, step_key = jax.random.split(key)
+            
+            # Convert PyTorch tensor to numpy
+            # batch_data is (B, C, H, W)
+            inputs = np.array(batch_data.numpy())
+            inputs = jnp.array(inputs)
+
+            model, opt_state, total_loss, recon_loss, commit_loss, indices_out, outputs = step_fn(
+                model, optimizer, opt_state, inputs, step_key, args.commitment_weight
+            )
+
+            epoch_losses.append(float(total_loss))
+            epoch_recon_losses.append(float(recon_loss))
+            epoch_commit_losses.append(float(commit_loss))
+
+            # Count unique codes used
+            if args.var_mode:
+                # indices_out is a list of arrays for each scale
+                all_indices = np.concatenate([np.array(idx).flatten() for idx in indices_out])
+                unique_codes = len(np.unique(all_indices))
+            else:
+                unique_codes = len(np.unique(np.array(indices_out)))
+
+            # Log to wandb
+            if WANDB_AVAILABLE:
+                wandb.log({
+                    "loss/total": float(total_loss),
+                    "loss/reconstruction": float(recon_loss),
+                    "loss/commitment": float(commit_loss),
+                    "codebook/unique_codes": unique_codes,
+                    "step": global_step,
+                })
+
+            if batch_idx % 50 == 0:
+                print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes}")
+
+                # Log reconstructions and codebook usage
+                if WANDB_AVAILABLE:
+                    recon_fig = plot_reconstruction(np.array(inputs), np.array(outputs), fields)
+                    if args.var_mode:
+                        # Concatenate all indices for histogram
+                        all_idx = np.concatenate([np.array(idx).flatten() for idx in indices_out])
+                        usage_fig = plot_codebook_usage(all_idx, args.vocab_size)
+                    else:
+                        usage_fig = plot_codebook_usage(indices_out, args.vocab_size)
+                    wandb.log({
+                        "reconstructions": wandb.Image(recon_fig),
+                        "codebook_usage": wandb.Image(usage_fig),
+                    })
+                    plt.close(recon_fig)
+                    plt.close(usage_fig)
+
+            global_step += 1
+
+        # Epoch summary
+        avg_loss = np.mean(epoch_losses)
+        avg_recon = np.mean(epoch_recon_losses)
+        avg_commit = np.mean(epoch_commit_losses)
+        print(f"Epoch {epoch + 1} Summary: Loss={avg_loss:.4f}, Recon={avg_recon:.4f}, Commit={avg_commit:.4f}")
+
         if WANDB_AVAILABLE:
             wandb.log({
-                "loss/total": float(total_loss),
-                "loss/reconstruction": float(recon_loss),
-                "loss/commitment": float(commit_loss),
-                "codebook/unique_codes": unique_codes,
-                "step": global_step,
+                "epoch/loss": avg_loss,
+                "epoch/reconstruction": avg_recon,
+                "epoch/commitment": avg_commit,
+                "epoch": epoch + 1,
             })
 
-        if batch_idx % 50 == 0:
-            print(f"  Batch {batch_idx}: Loss={total_loss:.4f}, Recon={recon_loss:.4f}, Commit={commit_loss:.4f}, Codes={unique_codes}")
+        # Save checkpoint
+        if (epoch + 1) % args.save_every == 0:
+            save_checkpoint(model, opt_state, epoch + 1, args.checkpoint_dir, args.var_mode)
 
-            # Log reconstructions and codebook usage
-            if WANDB_AVAILABLE:
-                recon_fig = plot_reconstruction(np.array(inputs), np.array(outputs), fields)
-                if args.var_mode:
-                    # Concatenate all indices for histogram
-                    all_idx = np.concatenate([np.array(idx).flatten() for idx in indices_out])
-                    usage_fig = plot_codebook_usage(all_idx, args.vocab_size)
-                else:
-                    usage_fig = plot_codebook_usage(indices_out, args.vocab_size)
-                wandb.log({
-                    "reconstructions": wandb.Image(recon_fig),
-                    "codebook_usage": wandb.Image(usage_fig),
-                })
-                plt.close(recon_fig)
-                plt.close(usage_fig)
+    # Save final checkpoint
+    save_checkpoint(model, opt_state, args.epochs, args.checkpoint_dir, args.var_mode)
 
-        global_step += 1
+    # Also save final weights to wandb run directory
+    if WANDB_AVAILABLE and wandb.run is not None:
+        prefix = "var_vqvae" if args.var_mode else "vqvae"
+        wandb_checkpoint_path = os.path.join(wandb.run.dir, f"{prefix}_final.eqx")
+        eqx.tree_serialise_leaves(wandb_checkpoint_path, model)
+        print(f"Saved final weights to {wandb_checkpoint_path}")
+        wandb.finish()
+    print("\nTraining complete!")
 
-    # Epoch summary
-    avg_loss = np.mean(epoch_losses)
-    avg_recon = np.mean(epoch_recon_losses)
-    avg_commit = np.mean(epoch_commit_losses)
-    print(f"Epoch {epoch + 1} Summary: Loss={avg_loss:.4f}, Recon={avg_recon:.4f}, Commit={avg_commit:.4f}")
-
-    if WANDB_AVAILABLE:
-        wandb.log({
-            "epoch/loss": avg_loss,
-            "epoch/reconstruction": avg_recon,
-            "epoch/commitment": avg_commit,
-            "epoch": epoch + 1,
-        })
-
-    # Save checkpoint
-    if (epoch + 1) % args.save_every == 0:
-        save_checkpoint(model, opt_state, epoch + 1, args.checkpoint_dir, args.var_mode)
-
-# Save final checkpoint
-save_checkpoint(model, opt_state, args.epochs, args.checkpoint_dir, args.var_mode)
-
-# Also save final weights to wandb run directory
-if WANDB_AVAILABLE and wandb.run is not None:
-    prefix = "var_vqvae" if args.var_mode else "vqvae"
-    wandb_checkpoint_path = os.path.join(wandb.run.dir, f"{prefix}_final.eqx")
-    eqx.tree_serialise_leaves(wandb_checkpoint_path, model)
-    print(f"Saved final weights to {wandb_checkpoint_path}")
-    wandb.finish()
-print("\nTraining complete!")
-
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
